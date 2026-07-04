@@ -1,0 +1,332 @@
+{
+  "runs": [
+    {
+      "id": "8210993e2d5841a3bbea3224d7f572be",
+      "type": "channel",
+      "source": "https://www.youtube.com/@NateBJones",
+      "status": "success",
+      "started_at": "2026-05-11T15:26:46Z",
+      "updated_at": "2026-05-11T15:27:58Z",
+      "finished_at": "2026-05-11T15:27:58Z",
+      "message": "Bulk fetch finished. Saved 15 of 15; skipped 0.",
+      "total": 15,
+      "successes": [
+        {
+          "video_id": "SX1myuPEDFg",
+          "title": "Lindy, JP Morgan, And OpenAI All Built The Same Layer. Most Teams Haven't.",
+          "url": "https://www.youtube.com/watch?v=SX1myuPEDFg",
+          "index": 1,
+          "total": 15,
+          "saved_at": "2026-05-11T15:26:52Z"
+        },
+        {
+          "video_id": "EpJ0CjTJSag",
+          "title": "Anthropic And OpenAI Just Admitted The Model Isn't Enough.",
+          "url": "https://www.youtube.com/watch?v=EpJ0CjTJSag",
+          "index": 2,
+          "total": 15,
+          "saved_at": "2026-05-11T15:26:57Z"
+        },
+        {
+          "video_id": "lNX4m6KmX4U",
+          "title": "Human Oversight Isn't Slowing AI Down, It's Protecting It #AIGovernance #Shorts",
+          "url": "https://www.youtube.com/shorts/lNX4m6KmX4U",
+          "index": 3,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:03Z"
+        },
+        {
+          "video_id": "BXb4AovU-VY",
+          "title": "How Fast Can We Actually Replace Workers with AI? #AI #jobs #career",
+          "url": "https://www.youtube.com/shorts/BXb4AovU-VY",
+          "index": 4,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:07Z"
+        },
+        {
+          "video_id": "647pSnX5H_Y",
+          "title": "You're Wasting 40% Of Your AI Time On Something Fixable",
+          "url": "https://www.youtube.com/watch?v=647pSnX5H_Y",
+          "index": 5,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:12Z"
+        },
+        {
+          "video_id": "cUo-QtAectY",
+          "title": "Frontier vs Comfortable: Where Do You Actually Sit? #ai #strategy #career",
+          "url": "https://www.youtube.com/shorts/cUo-QtAectY",
+          "index": 6,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:16Z"
+        },
+        {
+          "video_id": "W79FW7iUkro",
+          "title": "271 Vulnerabilities: What Mozilla's AI Found Changes Everything",
+          "url": "https://www.youtube.com/watch?v=W79FW7iUkro",
+          "index": 7,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:21Z"
+        },
+        {
+          "video_id": "5FLfz7KzV50",
+          "title": "While Markets Panic, This Happens #ai #opportunity",
+          "url": "https://www.youtube.com/shorts/5FLfz7KzV50",
+          "index": 8,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:25Z"
+        },
+        {
+          "video_id": "85Q9htV2CBE",
+          "title": "Your AI Agent Is Locked To One Model. OpenClaw Just Killed That.",
+          "url": "https://www.youtube.com/watch?v=85Q9htV2CBE",
+          "index": 9,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:29Z"
+        },
+        {
+          "video_id": "MfO_Edrgy0w",
+          "title": "16 Million Fake Accounts Stealing AI Capabilities #ai #news",
+          "url": "https://www.youtube.com/shorts/MfO_Edrgy0w",
+          "index": 10,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:34Z"
+        },
+        {
+          "video_id": "b1fxYGPbHeo",
+          "title": "The Work Primitive: What Every AI Product Leader Gets Wrong",
+          "url": "https://www.youtube.com/watch?v=b1fxYGPbHeo",
+          "index": 11,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:38Z"
+        },
+        {
+          "video_id": "caULlNzJGj0",
+          "title": "Nuclear Weapons vs AI: Which Is Actually Harder to Stop? #ai #nuclear",
+          "url": "https://www.youtube.com/shorts/caULlNzJGj0",
+          "index": 12,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:44Z"
+        },
+        {
+          "video_id": "Z0HizICooiw",
+          "title": "Consumer AI Has a Problem Nobody's Naming.",
+          "url": "https://www.youtube.com/watch?v=Z0HizICooiw",
+          "index": 13,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:49Z"
+        },
+        {
+          "video_id": "X1h75jqeD0Q",
+          "title": "This Is Why Distilled Models Collapse #AIShorts #LLM",
+          "url": "https://www.youtube.com/shorts/X1h75jqeD0Q",
+          "index": 14,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:52Z"
+        },
+        {
+          "video_id": "rYqt6mMlv7o",
+          "title": "AI's 'Thin Ice' Moment: Is Your Job Already Gone?\"",
+          "url": "https://www.youtube.com/watch?v=rYqt6mMlv7o",
+          "index": 15,
+          "total": 15,
+          "saved_at": "2026-05-11T15:27:58Z"
+        }
+      ],
+      "failures": [],
+      "skipped": [],
+      "metadata": {},
+      "success_count": 15,
+      "failure_count": 0,
+      "skipped_count": 0
+    },
+    {
+      "id": "d1c52ef907044a4299eab7abac9bee27",
+      "type": "watcher",
+      "source": "manual",
+      "status": "success",
+      "started_at": "2026-05-14T18:08:36Z",
+      "updated_at": "2026-05-14T18:08:53Z",
+      "finished_at": "2026-05-14T18:08:53Z",
+      "message": "Watcher refresh finished. Saved 7 of 15; skipped 8.",
+      "total": 15,
+      "successes": [
+        {
+          "video_id": "jwtpMSRAPAQ",
+          "title": "The Trillion Dollar Agentic Workflow Opportunity Is Here",
+          "url": "https://www.youtube.com/watch?v=jwtpMSRAPAQ",
+          "index": 1,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:39Z"
+        },
+        {
+          "video_id": "8n4OV0jotDs",
+          "title": "Professors Notice Something's Drastically Wrong #college #teacher",
+          "url": "https://www.youtube.com/shorts/8n4OV0jotDs",
+          "index": 2,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:41Z"
+        },
+        {
+          "video_id": "lqiwQiDglGk",
+          "title": "Pinecone Just Demoted Vector Search. Here's the Knowledge Layer.",
+          "url": "https://www.youtube.com/watch?v=lqiwQiDglGk",
+          "index": 3,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:43Z"
+        },
+        {
+          "video_id": "fsFxiXzwvp8",
+          "title": "I Built 2 AI Agents. One Had This. Total Game Changer #aiagents #ai #engineering",
+          "url": "https://www.youtube.com/shorts/fsFxiXzwvp8",
+          "index": 4,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:46Z"
+        },
+        {
+          "video_id": "x8Y404We8O8",
+          "title": "2025 Prompting vs 2026 Prompting #ai #comparison #shorts",
+          "url": "https://www.youtube.com/shorts/x8Y404We8O8",
+          "index": 5,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:48Z"
+        },
+        {
+          "video_id": "j5_wcDifNko",
+          "title": "ChatGPT Has 900M Weekly Users. Almost None Can Buy In It.",
+          "url": "https://www.youtube.com/watch?v=j5_wcDifNko",
+          "index": 6,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:51Z"
+        },
+        {
+          "video_id": "OhtcvogXtok",
+          "title": "While Execs Panic, This Skill Gets Rare #ai #career",
+          "url": "https://www.youtube.com/shorts/OhtcvogXtok",
+          "index": 7,
+          "total": 15,
+          "saved_at": "2026-05-14T18:08:53Z"
+        }
+      ],
+      "failures": [],
+      "skipped": [
+        {
+          "video_id": "SX1myuPEDFg",
+          "title": "LLM Agents: The Security Breach Pattern Nobody's Talking About",
+          "url": "https://www.youtube.com/watch?v=SX1myuPEDFg",
+          "reason": "Already saved",
+          "index": 8,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "EpJ0CjTJSag",
+          "title": "Anthropic And OpenAI Just Admitted The Model Isn't Enough.",
+          "url": "https://www.youtube.com/watch?v=EpJ0CjTJSag",
+          "reason": "Already saved",
+          "index": 9,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "lNX4m6KmX4U",
+          "title": "Human Oversight Isn't Slowing AI Down, It's Protecting It #AIGovernance #Shorts",
+          "url": "https://www.youtube.com/shorts/lNX4m6KmX4U",
+          "reason": "Already saved",
+          "index": 10,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "BXb4AovU-VY",
+          "title": "How Fast Can We Actually Replace Workers with AI? #AI #jobs #career",
+          "url": "https://www.youtube.com/shorts/BXb4AovU-VY",
+          "reason": "Already saved",
+          "index": 11,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "647pSnX5H_Y",
+          "title": "You're Wasting 40% Of Your AI Time On Something Fixable",
+          "url": "https://www.youtube.com/watch?v=647pSnX5H_Y",
+          "reason": "Already saved",
+          "index": 12,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "cUo-QtAectY",
+          "title": "Frontier vs Comfortable: Where Do You Actually Sit? #ai #strategy #career",
+          "url": "https://www.youtube.com/shorts/cUo-QtAectY",
+          "reason": "Already saved",
+          "index": 13,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "W79FW7iUkro",
+          "title": "271 Vulnerabilities: What Mozilla's AI Found Changes Everything",
+          "url": "https://www.youtube.com/watch?v=W79FW7iUkro",
+          "reason": "Already saved",
+          "index": 14,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        },
+        {
+          "video_id": "5FLfz7KzV50",
+          "title": "While Markets Panic, This Happens #ai #opportunity",
+          "url": "https://www.youtube.com/shorts/5FLfz7KzV50",
+          "reason": "Already saved",
+          "index": 15,
+          "total": 15,
+          "skipped_at": "2026-05-14T18:08:53Z"
+        }
+      ],
+      "metadata": {
+        "scheduled": false
+      },
+      "success_count": 7,
+      "failure_count": 0,
+      "skipped_count": 8
+    },
+    {
+      "id": "77066225dab34185a5636a7c16efa8bb",
+      "type": "video",
+      "source": "https://www.youtube.com/watch?v=55pTFVoclvE&t=22s",
+      "status": "success",
+      "started_at": "2026-05-20T18:30:45Z",
+      "updated_at": "2026-05-20T18:30:48Z",
+      "finished_at": "2026-05-20T18:30:48Z",
+      "message": "Successfully saved: I was laid off by Atlassian",
+      "total": 1,
+      "success_count": 1,
+      "failure_count": 0,
+      "skipped_count": 0,
+      "successes": [
+        {
+          "video_id": "55pTFVoclvE",
+          "title": "I was laid off by Atlassian",
+          "url": "https://www.youtube.com/watch?v=55pTFVoclvE&t=22s",
+          "index": 1,
+          "total": 1,
+          "saved_at": "2026-05-20T18:30:48Z"
+        }
+      ],
+      "failures": [],
+      "skipped": [],
+      "metadata": {}
+    }
+  ],
+  "watcher": {
+    "enabled": false,
+    "channels": [
+      "https://www.youtube.com/@NateBJones"
+    ],
+    "frequency_minutes": 360,
+    "languages": [
+      "en"
+    ],
+    "last_checked_at": "2026-05-14T18:08:53Z",
+    "next_check_at": null
+  }
+}

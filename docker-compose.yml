@@ -1,0 +1,17 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - YT_TRANSCRIPTS_ALLOWED_ORIGINS=*
+      - YT_TRANSCRIPTS_HOST=0.0.0.0
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5014:80"
+    depends_on:
+      - backend

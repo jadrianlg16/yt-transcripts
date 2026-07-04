@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Node/Vite
+node_modules/
+dist/
+dist-ssr/
+frontend/node_modules/
+frontend/dist/
+
+# Local transcript data
+transcripts_store.json
+transcripts_store.sqlite3
+research_organization.json
+exports/
+channels/
+
+# Environment and logs
+.env
+.env.*
+*.log
+logs/
+
+# Editor/system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

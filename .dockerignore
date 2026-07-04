@@ -1,0 +1,14 @@
+# Backend image context — keep it small. The backend doesn't need the frontend,
+# its node_modules, logs, caches, or the local DB/exports.
+frontend/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.sqlite3
+dist/
+exports/
+channels/
+.git/
+.venv/
+venv/

@@ -1,0 +1,13 @@
+{
+  "name": "yt-transcripts",
+  "private": true,
+  "scripts": {
+    "dev": "python run.py",
+    "backend": "python main.py",
+    "frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "lint": "npm --prefix frontend run lint",
+    "test": "python -m unittest",
+    "check": "python -m unittest && python -m py_compile main.py app.py mcp_server.py core/ai_artifacts.py core/ai_clients.py core/ai_settings.py core/fetcher.py core/fetch_reliability.py core/research.py core/runtime_settings.py core/semantic_search.py core/store.py core/sqlite_store.py core/organization.py run.py test_app.py test_storage.py test_runtime_settings.py test_stage2_research.py test_stage3_storage.py test_stage4_organization.py test_stage5_reliability.py test_stage6_ai.py test_stage6_api.py test_stage6_semantic.py test_stage7_operations.py && npm --prefix frontend run lint && npm --prefix frontend run build"
+  }
+}
