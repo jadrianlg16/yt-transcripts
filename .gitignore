@@ -14,9 +14,16 @@ frontend/node_modules/
 frontend/dist/
 
 # Local transcript data
+data/
 transcripts_store.json
 transcripts_store.sqlite3
 research_organization.json
+fetch_reliability.json
+mcp_settings.json
+system_settings.json
+ai_settings.json
+ai_artifacts.json
+semantic_index.json
 exports/
 channels/
 

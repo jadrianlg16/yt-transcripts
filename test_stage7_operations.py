@@ -1,5 +1,6 @@
 import json
 import os
+import gc
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ import mcp_server
 from core.ai_artifacts import AIArtifactStore
 from core.fetch_reliability import FetchReliabilityStore
 from core.organization import ResearchOrganizationStore
+from core.sqlite_store import SQLiteTranscriptStore
 from core.store import TranscriptStore
 
 
@@ -153,6 +155,26 @@ class Stage7OperationsApiTests(unittest.TestCase):
         self.assertEqual(cancel_response.status_code, 200)
         self.assertTrue(main.task_cancel_event.is_set())
         self.assertEqual(cancel_response.json()["status"], "cancel_requested")
+
+    def test_storage_migration_does_not_replace_an_active_sqlite_archive(self):
+        sqlite_path = os.path.join(self.temp_dir.name, "transcripts_store.sqlite3")
+        sqlite_store = SQLiteTranscriptStore(sqlite_path)
+        sqlite_store.add_entry(sample_entry())
+        sqlite_store.add_entry(sample_entry("stage700002"))
+        main.store = sqlite_store
+
+        with open("transcripts_store.json", "w", encoding="utf-8") as file:
+            json.dump([sample_entry("stale700001")], file)
+
+        response = self.client.post("/api/storage/migrate")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "already_active")
+        self.assertEqual(response.json()["storage"]["active_count"], 2)
+        self.assertEqual(len(sqlite_store.all_entries()), 2)
+        main.store = TranscriptStore(os.path.join(self.temp_dir.name, "transcripts.json"))
+        del sqlite_store
+        gc.collect()
 
 
 if __name__ == "__main__":

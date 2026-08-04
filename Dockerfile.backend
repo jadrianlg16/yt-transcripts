@@ -5,5 +5,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV YT_TRANSCRIPTS_HOST=0.0.0.0
-EXPOSE 8000
+ENV YT_TRANSCRIPTS_DATA_DIR=/app/data
+ENV TRANSCRIPT_STORE_BACKEND=sqlite
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000 8001
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

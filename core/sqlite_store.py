@@ -8,6 +8,7 @@ from typing import Any, Iterable, Iterator
 
 from core.research import search_entries as rank_search_entries
 from core.research import words
+from core.store import normalize_entry_display_fields
 
 DEFAULT_DB_FILE = "transcripts_store.sqlite3"
 UNKNOWN_CHANNEL = "Unknown Channel"
@@ -292,14 +293,14 @@ class SQLiteTranscriptStore:
             )
 
         return [
-            {
+            normalize_entry_display_fields({
                 "video_id": row["video_id"],
                 "title": row["title"],
                 "channel": row["channel"],
                 "saved_at": row["saved_at"],
                 "transcript": row["transcript"],
                 "segments": segments_by_video.get(row["video_id"], []),
-            }
+            })
             for row in rows
         ]
 

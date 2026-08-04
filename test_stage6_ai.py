@@ -145,6 +145,22 @@ class OllamaClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OllamaClient(base_url="https://example.com/api")
 
+    def test_runtime_base_url_override_reaches_host_ollama_from_docker(self):
+        settings = {
+            "base_url": "http://localhost:11434/api",
+            "summary_model": "llama3.2:3b",
+            "embedding_model": "nomic-embed-text",
+            "timeout_seconds": 3,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"YT_TRANSCRIPTS_OLLAMA_BASE_URL": "http://host.docker.internal:11434/api"},
+        ):
+            client = ollama_client_from_settings(settings)
+
+        self.assertEqual(client.base_url, "http://host.docker.internal:11434/api")
+
 
 class AIArtifactStoreTests(unittest.TestCase):
     def test_artifacts_persist_video_summaries_comparisons_timelines_and_generic_runs(self):

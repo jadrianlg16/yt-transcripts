@@ -4,14 +4,54 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      - YT_TRANSCRIPTS_ALLOWED_ORIGINS=*
-      - YT_TRANSCRIPTS_HOST=0.0.0.0
+      YT_TRANSCRIPTS_ALLOWED_ORIGINS: http://localhost:5014,http://127.0.0.1:5014,http://localhost:5173,http://127.0.0.1:5173
+      YT_TRANSCRIPTS_DATA_DIR: /app/data
+      YT_TRANSCRIPTS_HOST: 0.0.0.0
+      YT_TRANSCRIPTS_OLLAMA_BASE_URL: http://host.docker.internal:11434/api
+      TRANSCRIPT_STORE_BACKEND: sqlite
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["python", "mcp_server.py"]
+    ports:
+      - "127.0.0.1:8001:8001"
+    environment:
+      YT_TRANSCRIPTS_DATA_DIR: /app/data
+      YT_TRANSCRIPTS_MCP_HOST: 0.0.0.0
+      YT_TRANSCRIPTS_MCP_PORT: 8001
+      YT_TRANSCRIPTS_MCP_TRANSPORT: streamable-http
+      YT_TRANSCRIPTS_OLLAMA_BASE_URL: http://host.docker.internal:11434/api
+      TRANSCRIPT_STORE_BACKEND: sqlite
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; connection = socket.create_connection(('127.0.0.1', 8001), timeout=5); connection.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
   frontend:
     build:
       context: ./frontend
     ports:
-      - "5014:80"
+      - "127.0.0.1:5014:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

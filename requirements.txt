@@ -1,7 +1,7 @@
-youtube-transcript-api
-requests
-scrapetube
-fastapi
-uvicorn
-pydantic
-mcp
+youtube-transcript-api==1.2.4
+requests==2.34.2
+scrapetube==2.6.0
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+mcp==1.29.0

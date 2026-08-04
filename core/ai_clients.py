@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -196,8 +197,13 @@ def ollama_client_from_settings(
     settings: dict[str, Any],
     allow_remote_base_url: bool = False,
 ) -> OllamaClient:
+    runtime_settings = dict(settings or {})
+    runtime_base_url = os.getenv("YT_TRANSCRIPTS_OLLAMA_BASE_URL", "").strip()
+    if runtime_base_url:
+        runtime_settings["base_url"] = runtime_base_url
+        allow_remote_base_url = True
     return OllamaClient.from_settings(
-        settings,
+        runtime_settings,
         allow_remote_base_url=allow_remote_base_url,
     )
 

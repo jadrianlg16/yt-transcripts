@@ -9,10 +9,53 @@
 The project has been upgraded from Tkinter to a modern web interface.
 
 ### Prerequisites
-- Python 3.10+
-- Node.js & npm
+- Docker Desktop (recommended for Project Dashboard)
+- Or Python 3.10+ plus Node.js & npm for local development
 
-### Setup & Run (One-Step)
+### Run from Project Dashboard (recommended)
+
+The existing **YouTube Transcripts** card starts this Compose stack and opens
+`http://localhost:5014`. Runtime state is stored in the host `data/` directory,
+so container rebuilds and recreations keep the SQLite archive.
+
+The browser uses the frontend as its only public entry point. Nginx forwards
+`/api` requests to the backend inside Docker, while port `8000` remains bound to
+localhost for diagnostics.
+
+### Run with Docker directly
+
+```bash
+docker compose up -d --build
+```
+
+Open `http://localhost:5014`. To stop the stack without deleting its data:
+
+```bash
+docker compose down
+```
+
+### Connect an AI model through MCP
+
+The Compose stack also starts a read-only MCP endpoint at
+`http://127.0.0.1:8001/mcp`. Turn MCP access on from **Settings > MCP**, then
+connect a local MCP-compatible client using the included `.mcp.json` file.
+
+The compatibility tools follow the frontier-model retrieval contract:
+
+- `search(query)` returns document IDs, video titles, and canonical YouTube URLs.
+- `fetch(id)` returns the complete transcript plus source metadata.
+
+Search works immediately with lexical ranking. If local AI is enabled and a
+semantic index has been built from the AI settings screen, it automatically
+combines lexical and Ollama vector rankings. In Docker, Ollama is reached on the
+Windows host through `host.docker.internal`.
+
+The MCP port is bound only to this computer. A hosted model cannot call a
+localhost URL directly; use an authenticated HTTPS deployment or a secure MCP
+tunnel before connecting a remote client. Do not expose port `8001` publicly
+without authentication.
+
+### Setup & Run locally (One-Step)
 
 Simply run the helper script to start both backend and frontend:
 ```bash
@@ -68,7 +111,8 @@ If you prefer to run them separately:
 - **Stealth Mode:** Built-in random timeouts (jitter) between requests to mimic human behavior and prevent IP blocks.
 
 ### 📂 Organized Storage
-- **JSON Database:** All transcripts are saved in a structured `transcripts_store.json` for easy programmatic access.
+- **SQLite Database:** SQLite is the canonical runtime archive; JSON remains a portable backup/export format.
+- **Persistent Docker Data:** Docker reads and writes runtime files beneath the host `data/` directory.
 - **Channel Folders:** Bulk exports are neatly organized into channel-specific directories within the `/channels` folder.
 - **One-Click Export Access:** Direct button to open your storage folder in the system file explorer.
 - **SQLite-ready Storage:** The web UI can migrate JSON archives to SQLite and keep JSON exports as portable backups.

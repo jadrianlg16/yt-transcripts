@@ -6,6 +6,15 @@ __pycache__/
 *.pyc
 *.log
 *.sqlite3
+transcripts_store.json
+research_organization.json
+fetch_reliability.json
+mcp_settings.json
+system_settings.json
+ai_settings.json
+ai_artifacts.json
+semantic_index.json
+data/
 dist/
 exports/
 channels/

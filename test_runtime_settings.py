@@ -2,7 +2,10 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from core.paths import data_path
 from core.runtime_settings import (
     load_mcp_settings,
     load_system_settings,
@@ -12,6 +15,14 @@ from core.runtime_settings import (
 
 
 class RuntimeSettingsTests(unittest.TestCase):
+    def test_data_path_uses_configured_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {"YT_TRANSCRIPTS_DATA_DIR": temp_dir}):
+                self.assertEqual(
+                    data_path("transcripts_store.sqlite3"),
+                    Path(temp_dir) / "transcripts_store.sqlite3",
+                )
+
     def test_mcp_settings_defaults_update_and_recover_from_corrupt_json(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "mcp_settings.json")

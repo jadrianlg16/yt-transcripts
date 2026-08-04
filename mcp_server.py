@@ -5,7 +5,9 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
+from pydantic import BaseModel, Field
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -15,9 +17,12 @@ except ImportError as exc:  # pragma: no cover - only reached before requirement
     ) from exc
 
 from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationStore
+from core.ai_clients import OllamaClientError, ollama_client_from_settings
+from core.ai_settings import DEFAULT_AI_SETTINGS_FILE, AISettingsStore
 from core.research import library_stats, search_entries, words
 from core.runtime_settings import load_mcp_settings
-from core.store import DATA_FILE, SQLITE_DATA_FILE
+from core.semantic_search import load_semantic_index, search_semantic_items
+from core.store import DATA_FILE, SQLITE_DATA_FILE, normalize_entry_display_fields
 
 
 DEFAULT_LIST_LIMIT = 50
@@ -32,6 +37,27 @@ DEFAULT_SEGMENT_LIMIT = 150
 MAX_SEGMENT_LIMIT = 1000
 DEFAULT_SEGMENT_CHARS = 500
 MAX_SEGMENT_CHARS = 2000
+DEFAULT_STANDARD_SEARCH_LIMIT = 10
+MAX_STANDARD_SEARCH_LIMIT = 25
+RRF_RANK_CONSTANT = 60
+
+
+class SearchResult(BaseModel):
+    id: str
+    title: str
+    url: str
+
+
+class SearchOutput(BaseModel):
+    results: list[SearchResult]
+
+
+class FetchOutput(BaseModel):
+    id: str
+    title: str
+    text: str
+    url: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def _looks_like_project_root(path: Path) -> bool:
@@ -56,19 +82,46 @@ def _project_root() -> Path:
 
 
 PROJECT_ROOT = _project_root()
-mcp = FastMCP("yt-transcripts-readonly")
+
+
+def _mcp_port() -> int:
+    try:
+        port = int(os.getenv("YT_TRANSCRIPTS_MCP_PORT", "8001"))
+    except ValueError:
+        port = 8001
+    return max(1, min(port, 65535))
+
+
+mcp = FastMCP(
+    "yt-transcripts-readonly",
+    instructions=(
+        "Read-only access to a local YouTube transcript archive. "
+        "Call search with a natural-language query, then call fetch with a returned id "
+        "to read the complete transcript and its source URL."
+    ),
+    host=os.getenv("YT_TRANSCRIPTS_MCP_HOST", "127.0.0.1"),
+    port=_mcp_port(),
+    streamable_http_path="/mcp",
+    json_response=True,
+    stateless_http=True,
+)
 
 
 def _mcp_disabled_response() -> dict[str, Any]:
     return {
         "available": False,
         "message": "MCP access is disabled in YouTube Transcript Pro settings.",
-        "settings_path": str(_project_path("mcp_settings.json")),
+        "settings_path": str(_data_path("mcp_settings.json")),
     }
 
 
 def _mcp_enabled() -> bool:
-    return bool(load_mcp_settings(_project_path("mcp_settings.json")).get("enabled"))
+    return bool(load_mcp_settings(_data_path("mcp_settings.json")).get("enabled"))
+
+
+def _require_mcp_enabled() -> None:
+    if not _mcp_enabled():
+        raise PermissionError("MCP access is disabled in YouTube Transcript Pro settings.")
 
 
 def _project_path(path: str | Path) -> Path:
@@ -76,6 +129,21 @@ def _project_path(path: str | Path) -> Path:
     if candidate.is_absolute():
         return candidate
     return PROJECT_ROOT / candidate
+
+
+def _data_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+
+    configured = os.getenv("YT_TRANSCRIPTS_DATA_DIR", "").strip()
+    if not configured:
+        return _project_path(candidate)
+
+    data_root = Path(configured).expanduser()
+    if not data_root.is_absolute():
+        data_root = PROJECT_ROOT / data_root
+    return data_root / candidate
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -149,7 +217,7 @@ def _load_sqlite_entries(path: Path) -> list[dict[str, Any]]:
                 )
 
         return [
-            {
+            normalize_entry_display_fields({
                 "video_id": row["video_id"],
                 "title": row["title"],
                 "channel": row["channel"],
@@ -158,7 +226,7 @@ def _load_sqlite_entries(path: Path) -> list[dict[str, Any]]:
                 "updated_at": row["updated_at"],
                 "transcript": row["transcript"],
                 "segments": segments_by_video.get(str(row["video_id"]), []),
-            }
+            })
             for row in video_rows
         ]
     finally:
@@ -168,12 +236,16 @@ def _load_sqlite_entries(path: Path) -> list[dict[str, Any]]:
 def _load_json_entries(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
-    return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+    return (
+        [normalize_entry_display_fields(entry) for entry in data if isinstance(entry, dict)]
+        if isinstance(data, list)
+        else []
+    )
 
 
 def _load_transcripts() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    sqlite_path = _project_path(SQLITE_DATA_FILE)
-    json_path = _project_path(DATA_FILE)
+    sqlite_path = _data_path(SQLITE_DATA_FILE)
+    json_path = _data_path(DATA_FILE)
     warnings: list[str] = []
 
     if sqlite_path.exists():
@@ -243,6 +315,221 @@ def _entry_summary(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _canonical_video_url(entry: dict[str, Any]) -> str:
+    source_url = str(entry.get("source_url") or "").strip()
+    parsed = urlparse(source_url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return source_url
+
+    video_id = quote(str(entry.get("video_id") or "").strip(), safe="")
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _sqlite_fts_candidate_ids(query: str, limit: int) -> tuple[list[str], bool]:
+    path = _data_path(SQLITE_DATA_FILE)
+    if not path.exists():
+        return [], False
+
+    terms = [term for term in words(query) if len(term) > 1]
+    if not terms:
+        return [], True
+
+    fts_query = " ".join(f"{term}*" for term in terms)
+    try:
+        connection = sqlite3.connect(_sqlite_uri(path), uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT video_id
+                FROM video_search_fts
+                WHERE video_search_fts MATCH ?
+                ORDER BY bm25(video_search_fts)
+                LIMIT ?
+                """,
+                (fts_query, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return [], False
+
+    return [str(row["video_id"]) for row in rows], True
+
+
+def _semantic_video_results(
+    query: str,
+    allowed_video_ids: set[str],
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    path = _semantic_index_path()
+    diagnostics: dict[str, Any] = {
+        "available": False,
+        "used": False,
+        "index_path": str(path),
+        "reason": "Semantic index has not been built.",
+    }
+
+    try:
+        index = load_semantic_index(str(path))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        diagnostics["reason"] = f"Semantic index could not be read: {exc}"
+        return [], diagnostics
+
+    items = index.get("items") or []
+    if not items:
+        return [], diagnostics
+
+    diagnostics["available"] = True
+    settings = AISettingsStore(_data_path(DEFAULT_AI_SETTINGS_FILE)).get_settings()
+    if not settings.get("enabled"):
+        diagnostics["reason"] = "AI is disabled; lexical search remains available."
+        return [], diagnostics
+
+    try:
+        client = ollama_client_from_settings(settings)
+        response = client.embed(
+            query,
+            model=settings["embedding_model"],
+            timeout_seconds=min(int(settings.get("timeout_seconds") or 10), 10),
+        )
+        embeddings = response.get("embeddings") or []
+        if not embeddings:
+            raise OllamaClientError("Ollama returned no query embedding")
+        chunk_results = search_semantic_items(
+            items,
+            embeddings[0],
+            limit=max(limit * 8, 40),
+            embedding_model=settings["embedding_model"],
+        )
+    except (OllamaClientError, OSError, ValueError) as exc:
+        diagnostics["reason"] = f"Semantic query unavailable: {exc}"
+        return [], diagnostics
+
+    video_results = []
+    seen: set[str] = set()
+    for result in chunk_results:
+        video_id = str(result.get("video_id") or "")
+        if not video_id or video_id not in allowed_video_ids or video_id in seen:
+            continue
+        seen.add(video_id)
+        video_results.append(result)
+        if len(video_results) >= limit:
+            break
+
+    diagnostics.update(
+        {
+            "used": True,
+            "reason": "Combined lexical matches with Ollama vector similarity.",
+            "embedding_model": settings["embedding_model"],
+            "chunk_count": len(items),
+        }
+    )
+    return video_results, diagnostics
+
+
+def _hybrid_search_entries(
+    entries: list[dict[str, Any]],
+    query: str,
+    limit: int,
+    channel: str | None = None,
+    matches_per_entry: int = 4,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    bounded_limit = _bounded_int(limit, 10, 1, 100)
+    channel_filter = (channel or "").strip().lower()
+    eligible_entries = [
+        entry
+        for entry in entries
+        if not channel_filter
+        or str(entry.get("channel") or "Unknown Channel").lower() == channel_filter
+    ]
+    entry_lookup = _transcript_lookup(eligible_entries)
+    candidate_limit = min(max(bounded_limit * 5, 25), 200)
+    fts_ids, fts_used = _sqlite_fts_candidate_ids(query, candidate_limit)
+    lexical_candidates = (
+        [entry_lookup[video_id] for video_id in fts_ids if video_id in entry_lookup]
+        if fts_used
+        else eligible_entries
+    )
+    lexical_results = search_entries(
+        lexical_candidates,
+        query=query,
+        limit=candidate_limit,
+        matches_per_entry=matches_per_entry,
+        sort="relevance",
+    )
+    semantic_results, semantic = _semantic_video_results(
+        query,
+        set(entry_lookup),
+        candidate_limit,
+    )
+
+    lexical_by_id = {
+        str(result.get("video_id") or ""): (rank, result)
+        for rank, result in enumerate(lexical_results, start=1)
+        if result.get("video_id")
+    }
+    semantic_by_id = {
+        str(result.get("video_id") or ""): (rank, result)
+        for rank, result in enumerate(semantic_results, start=1)
+        if result.get("video_id")
+    }
+
+    fused_results = []
+    for video_id in set(lexical_by_id) | set(semantic_by_id):
+        entry = entry_lookup.get(video_id)
+        if entry is None:
+            continue
+
+        lexical_pair = lexical_by_id.get(video_id)
+        semantic_pair = semantic_by_id.get(video_id)
+        score = 0.0
+        if lexical_pair:
+            score += 1 / (RRF_RANK_CONSTANT + lexical_pair[0])
+        if semantic_pair:
+            score += 1 / (RRF_RANK_CONSTANT + semantic_pair[0])
+
+        result = dict(lexical_pair[1]) if lexical_pair else _entry_summary(entry)
+        semantic_match = semantic_pair[1] if semantic_pair else None
+        if not lexical_pair and semantic_match:
+            result["matches"] = [
+                {
+                    "text": semantic_match.get("text", ""),
+                    "start": semantic_match.get("start", 0),
+                    "duration": max(
+                        0.0,
+                        float(semantic_match.get("end", 0) or 0)
+                        - float(semantic_match.get("start", 0) or 0),
+                    ),
+                }
+            ]
+            result["match_count"] = 1
+        result.update(
+            {
+                "retrieval_score": score,
+                "lexical_rank": lexical_pair[0] if lexical_pair else None,
+                "semantic_rank": semantic_pair[0] if semantic_pair else None,
+                "semantic_score": semantic_match.get("score") if semantic_match else None,
+            }
+        )
+        fused_results.append(result)
+
+    fused_results.sort(
+        key=lambda result: (
+            -float(result.get("retrieval_score") or 0),
+            result.get("title") or "",
+            result.get("video_id") or "",
+        )
+    )
+    diagnostics = {
+        "method": "hybrid_rrf" if semantic.get("used") else "lexical_fallback",
+        "lexical_method": "sqlite_fts" if fts_used else "in_memory",
+        "lexical_result_count": len(lexical_results),
+        "semantic": semantic,
+    }
+    return fused_results[:bounded_limit], diagnostics
+
+
 def _capped_segments(
     entry: dict[str, Any],
     max_segments: int,
@@ -288,7 +575,7 @@ def _capped_segments(
 
 
 def _organization_store() -> ResearchOrganizationStore:
-    return ResearchOrganizationStore(_project_path(DEFAULT_ORGANIZATION_FILE))
+    return ResearchOrganizationStore(_data_path(DEFAULT_ORGANIZATION_FILE))
 
 
 def _cap_match_text(results: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
@@ -309,6 +596,64 @@ def _cap_match_text(results: list[dict[str, Any]], max_chars: int) -> list[dict[
         item["matches"] = matches
         capped_results.append(item)
     return capped_results
+
+
+@mcp.tool(structured_output=True)
+def search(query: str) -> SearchOutput:
+    """Search the transcript archive and return canonical document references for fetch."""
+    _require_mcp_enabled()
+    entries, _storage = _load_transcripts()
+    limit = _bounded_int(
+        os.getenv("YT_TRANSCRIPTS_MCP_SEARCH_LIMIT"),
+        DEFAULT_STANDARD_SEARCH_LIMIT,
+        1,
+        MAX_STANDARD_SEARCH_LIMIT,
+    )
+    results, _diagnostics = _hybrid_search_entries(entries, query, limit=limit)
+    return SearchOutput(
+        results=[
+            SearchResult(
+                id=str(result.get("video_id") or ""),
+                title=str(result.get("title") or "Untitled Video"),
+                url=_canonical_video_url(
+                    _entry_by_video_id(entries, str(result.get("video_id") or "")) or result
+                ),
+            )
+            for result in results
+            if result.get("video_id")
+        ]
+    )
+
+
+@mcp.tool(structured_output=True)
+def fetch(id: str) -> FetchOutput:
+    """Fetch the complete transcript and metadata for an id returned by search."""
+    _require_mcp_enabled()
+    entries, storage = _load_transcripts()
+    video_id = str(id or "").strip()
+    entry = _entry_by_video_id(entries, video_id)
+    if entry is None:
+        raise ValueError(f"Transcript not found: {video_id}")
+
+    summary = _entry_summary(entry)
+    return FetchOutput(
+        id=video_id,
+        title=str(summary["title"]),
+        text=str(entry.get("transcript") or ""),
+        url=_canonical_video_url(entry),
+        metadata={
+            "source": "youtube_transcript",
+            "video_id": video_id,
+            "channel": summary["channel"],
+            "saved_at": summary["saved_at"],
+            "uploaded_at": summary["uploaded_at"],
+            "fetched_at": summary["fetched_at"],
+            "word_count": summary["word_count"],
+            "segment_count": summary["segment_count"],
+            "duration_seconds": summary["duration_seconds"],
+            "storage_backend": storage["backend"],
+        },
+    )
 
 
 @mcp.tool()
@@ -363,25 +708,40 @@ def search_transcripts(
     matches_per_entry: int = 4,
     max_match_chars: int = DEFAULT_MATCH_CHARS,
 ) -> dict[str, Any]:
-    """Search transcript titles and text with the app's local lexical ranking."""
+    """Search transcripts with hybrid lexical and vector ranking when embeddings are ready."""
     if not _mcp_enabled():
         return _mcp_disabled_response()
 
     entries, storage = _load_transcripts()
     bounded_limit = _bounded_int(limit, 10, 1, 100)
     bounded_matches = _bounded_int(matches_per_entry, 4, 0, 10)
-    results = search_entries(
-        entries,
-        query=query,
-        channel=channel,
-        limit=bounded_limit,
-        matches_per_entry=bounded_matches,
-        sort=sort,
-    )
+    if (sort or "relevance").lower() == "relevance":
+        results, retrieval = _hybrid_search_entries(
+            entries,
+            query=query,
+            channel=channel,
+            limit=bounded_limit,
+            matches_per_entry=bounded_matches,
+        )
+    else:
+        results = search_entries(
+            entries,
+            query=query,
+            channel=channel,
+            limit=bounded_limit,
+            matches_per_entry=bounded_matches,
+            sort=sort,
+        )
+        retrieval = {
+            "method": "lexical_sorted",
+            "lexical_result_count": len(results),
+            "semantic": {"available": False, "used": False, "reason": "Non-relevance sort selected."},
+        }
     return {
         "query": query,
         "results": _cap_match_text(results, max_match_chars),
         "count": len(results),
+        "retrieval": retrieval,
         "storage": storage,
     }
 
@@ -465,7 +825,7 @@ def list_collections(include_clips: bool = True, limit: int = 100) -> dict[str, 
         "items": items,
         "count": len(items),
         "total": len(collections) if isinstance(collections, list) else 0,
-        "path": str(_project_path(DEFAULT_ORGANIZATION_FILE)),
+        "path": str(_data_path(DEFAULT_ORGANIZATION_FILE)),
     }
 
 
@@ -505,81 +865,8 @@ def get_collection_markdown(
 
 
 def _semantic_index_path() -> Path:
-    return _project_path(os.getenv("SEMANTIC_INDEX_FILE", "semantic_index.json"))
-
-
-def _semantic_records(raw: Any) -> list[dict[str, Any]]:
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    if not isinstance(raw, dict):
-        return []
-
-    for key in ("items", "entries", "chunks", "documents", "records", "vectors"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
-
-    nested = raw.get("index")
-    if isinstance(nested, (dict, list)):
-        return _semantic_records(nested)
-    return []
-
-
-def _record_text(record: dict[str, Any]) -> str:
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    text_parts = []
-    for source in (record, metadata):
-        for key in ("title", "channel", "text", "content", "chunk", "snippet", "transcript", "summary"):
-            value = source.get(key)
-            if value:
-                text_parts.append(str(value))
-    return "\n".join(text_parts)
-
-
-def _record_identity(record: dict[str, Any]) -> dict[str, Any]:
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    source = {**metadata, **record}
-    return {
-        "video_id": source.get("video_id") or source.get("id") or "",
-        "title": source.get("title") or "",
-        "channel": source.get("channel") or "",
-        "start": source.get("start"),
-        "end": source.get("end"),
-    }
-
-
-def _rank_semantic_records(
-    records: list[dict[str, Any]],
-    query: str,
-    limit: int,
-    max_text_chars: int,
-) -> list[dict[str, Any]]:
-    phrase = " ".join((query or "").lower().split())
-    terms = [term for term in words(phrase) if len(term) > 1]
-    if not phrase or not terms:
-        return []
-
-    ranked = []
-    for record in records:
-        text = _record_text(record)
-        normalized = text.lower()
-        phrase_hits = normalized.count(phrase)
-        term_hits = sum(normalized.count(term) for term in terms)
-        score = phrase_hits * 5 + term_hits
-        if score <= 0:
-            continue
-        capped = _cap_text(text, max_text_chars)
-        ranked.append(
-            {
-                **_record_identity(record),
-                "score": score,
-                "text": capped["text"],
-                "text_char_count": capped["char_count"],
-                "text_truncated": capped["truncated"],
-            }
-        )
-
-    return sorted(ranked, key=lambda item: item["score"], reverse=True)[:limit]
+    configured = os.getenv("SEMANTIC_INDEX_FILE", "").strip()
+    return _project_path(configured) if configured else _data_path("semantic_index.json")
 
 
 @mcp.tool()
@@ -588,58 +875,31 @@ def semantic_search(
     limit: int = 10,
     max_text_chars: int = DEFAULT_MATCH_CHARS,
 ) -> dict[str, Any]:
-    """Search semantic_index.json when present; report clearly when the index has not been built."""
+    """Run hybrid retrieval, using real vector similarity when the local index is ready."""
     if not _mcp_enabled():
         return _mcp_disabled_response()
 
-    path = _semantic_index_path()
-    if not path.exists():
-        return {
-            "available": False,
-            "query": query,
-            "index_path": str(path),
-            "message": "semantic_index.json is missing. Build the local semantic index before using semantic search.",
-            "results": [],
-        }
-
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            raw = json.load(file)
-    except (OSError, json.JSONDecodeError) as exc:
-        return {
-            "available": False,
-            "query": query,
-            "index_path": str(path),
-            "message": f"semantic_index.json could not be read: {exc}",
-            "results": [],
-        }
-
-    records = _semantic_records(raw)
-    if not records:
-        return {
-            "available": True,
-            "query": query,
-            "index_path": str(path),
-            "message": "semantic_index.json was found, but it did not contain searchable records.",
-            "results": [],
-        }
-
     bounded_limit = _bounded_int(limit, 10, 1, 100)
-    results = _rank_semantic_records(records, query, bounded_limit, max_text_chars)
+    entries, storage = _load_transcripts()
+    results, retrieval = _hybrid_search_entries(
+        entries,
+        query,
+        limit=bounded_limit,
+        matches_per_entry=4,
+    )
     return {
-        "available": True,
+        "available": bool(entries),
         "query": query,
-        "index_path": str(path),
-        "method": "semantic_index_text_rank",
-        "results": results,
+        "method": retrieval["method"],
+        "results": _cap_match_text(results, max_text_chars),
         "count": len(results),
-        "record_count": len(records),
-        "message": (
-            "Read semantic_index.json without rebuilding embeddings. "
-            "Results are ranked from searchable index text fields."
-        ),
+        "retrieval": retrieval,
+        "storage": storage,
     }
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    transport = os.getenv("YT_TRANSCRIPTS_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise SystemExit(f"Unsupported MCP transport: {transport}")
+    mcp.run(transport=transport)

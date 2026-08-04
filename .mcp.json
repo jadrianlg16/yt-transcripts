@@ -1,17 +1,8 @@
 {
   "mcpServers": {
     "yt-transcripts": {
-      "type": "stdio",
-      "command": "cmd",
-      "args": [
-        "/d",
-        "/c",
-        "cd /d \"${CLAUDE_PROJECT_DIR:-.}\" && \"${PYTHON:-python}\" mcp_server.py"
-      ],
-      "env": {
-        "YT_TRANSCRIPTS_PROJECT_ROOT": "${CLAUDE_PROJECT_DIR:-.}",
-        "TRANSCRIPT_STORE_BACKEND": "auto"
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:8001/mcp"
     }
   }
 }

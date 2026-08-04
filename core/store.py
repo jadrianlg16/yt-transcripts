@@ -1,9 +1,18 @@
+import html
 import json
 import os
 from typing import Any, Dict, List, Protocol
 
 DATA_FILE = "transcripts_store.json"
 SQLITE_DATA_FILE = "transcripts_store.sqlite3"
+
+
+def normalize_entry_display_fields(entry: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(entry)
+    for key in ("title", "channel"):
+        if normalized.get(key) is not None:
+            normalized[key] = html.unescape(str(normalized[key]))
+    return normalized
 
 
 class TranscriptRepository(Protocol):
@@ -30,13 +39,18 @@ class JsonTranscriptStore:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             return []
-        return data if isinstance(data, list) else []
+        return (
+            [normalize_entry_display_fields(entry) for entry in data if isinstance(entry, dict)]
+            if isinstance(data, list)
+            else []
+        )
 
     def save(self):
         with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     def add_entry(self, entry):
+        entry = normalize_entry_display_fields(entry)
         # Prevent duplicates in the UI list if video_id matches
         self.data = [e for e in self.data if e.get('video_id') != entry['video_id']]
         self.data.append(entry)

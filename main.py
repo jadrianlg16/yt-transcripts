@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import time
 import random
 import scrapetube
@@ -24,13 +25,14 @@ from uuid import uuid4
 
 from core.store import DATA_FILE, SQLITE_DATA_FILE, TranscriptRepository, create_transcript_store
 from core.fetcher import extract_video_id, fetch_video_full
-from core.fetch_reliability import FetchReliabilityStore, youtube_watch_url
-from core.organization import ResearchOrganizationStore, utc_now
+from core.fetch_reliability import DEFAULT_RELIABILITY_FILE, FetchReliabilityStore, youtube_watch_url
+from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationStore, utc_now
 from core.research import library_stats, search_entries
 from core.sqlite_store import SQLiteTranscriptStore, export_entries_to_json, migrate_json_to_sqlite
-from core.ai_artifacts import AIArtifactStore, transcript_hash
+from core.ai_artifacts import DEFAULT_AI_ARTIFACTS_FILE, AIArtifactStore, transcript_hash
 from core.ai_clients import OllamaClientError, ollama_client_from_settings
-from core.ai_settings import AISettingsStore
+from core.ai_settings import DEFAULT_AI_SETTINGS_FILE, AISettingsStore
+from core.paths import data_path
 from core.runtime_settings import (
     DEFAULT_MCP_SETTINGS_FILE,
     DEFAULT_SYSTEM_SETTINGS_FILE,
@@ -54,13 +56,27 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-store: TranscriptRepository = create_transcript_store()
-organization_store = ResearchOrganizationStore()
-reliability_store = FetchReliabilityStore()
-ai_settings_store = AISettingsStore()
-ai_artifact_store = AIArtifactStore()
-semantic_index_store = SemanticIndexStore()
-EXPORTS_DIR = "exports"
+TRANSCRIPTS_JSON_PATH = data_path(DATA_FILE)
+TRANSCRIPTS_SQLITE_PATH = data_path(SQLITE_DATA_FILE)
+ORGANIZATION_PATH = data_path(DEFAULT_ORGANIZATION_FILE)
+RELIABILITY_PATH = data_path(DEFAULT_RELIABILITY_FILE)
+AI_SETTINGS_PATH = data_path(DEFAULT_AI_SETTINGS_FILE)
+AI_ARTIFACTS_PATH = data_path(DEFAULT_AI_ARTIFACTS_FILE)
+MCP_SETTINGS_PATH = data_path(DEFAULT_MCP_SETTINGS_FILE)
+SYSTEM_SETTINGS_PATH = data_path(DEFAULT_SYSTEM_SETTINGS_FILE)
+SEMANTIC_INDEX_PATH = data_path(DEFAULT_INDEX_PATH)
+EXPORTS_DIR = data_path("exports")
+CHANNELS_DIR = data_path("channels")
+
+store: TranscriptRepository = create_transcript_store(
+    json_path=str(TRANSCRIPTS_JSON_PATH),
+    sqlite_path=str(TRANSCRIPTS_SQLITE_PATH),
+)
+organization_store = ResearchOrganizationStore(ORGANIZATION_PATH)
+reliability_store = FetchReliabilityStore(RELIABILITY_PATH)
+ai_settings_store = AISettingsStore(AI_SETTINGS_PATH)
+ai_artifact_store = AIArtifactStore(AI_ARTIFACTS_PATH)
+semantic_index_store = SemanticIndexStore(str(SEMANTIC_INDEX_PATH))
 DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 BACKEND_EVENTS_LIMIT = 300
 backend_events = deque(maxlen=BACKEND_EVENTS_LIMIT)
@@ -71,6 +87,8 @@ task_status_lock = threading.Lock()
 task_cancel_event = threading.Event()
 
 MCP_TOOL_NAMES = [
+    "search",
+    "fetch",
     "list_transcripts",
     "search_transcripts",
     "get_transcript",
@@ -259,38 +277,40 @@ def _entry_count_from_json(path: str) -> int:
 
     return len(data) if isinstance(data, list) else 0
 
-def _entry_count_from_sqlite(path: str) -> int:
+def _entry_count_from_sqlite(path: str | Path) -> int:
     if not os.path.exists(path):
         return 0
 
     try:
-        return len(SQLiteTranscriptStore(path).all_entries())
-    except (OSError, ValueError):
+        with sqlite3.connect(path) as connection:
+            row = connection.execute("SELECT COUNT(*) FROM videos").fetchone()
+            return int(row[0]) if row else 0
+    except (OSError, sqlite3.Error, TypeError, ValueError):
         return 0
 
 def _storage_status():
-    sqlite_exists = os.path.exists(SQLITE_DATA_FILE)
+    sqlite_exists = TRANSCRIPTS_SQLITE_PATH.exists()
     active_backend = "sqlite" if isinstance(store, SQLiteTranscriptStore) else "json"
 
     return {
         "backend": active_backend,
         "active_count": len(store.all_entries()),
         "json": {
-            "path": str(Path(DATA_FILE).resolve()),
-            "exists": os.path.exists(DATA_FILE),
-            "count": _entry_count_from_json(DATA_FILE),
+            "path": str(TRANSCRIPTS_JSON_PATH.resolve()),
+            "exists": TRANSCRIPTS_JSON_PATH.exists(),
+            "count": _entry_count_from_json(str(TRANSCRIPTS_JSON_PATH)),
         },
         "sqlite": {
-            "path": str(Path(SQLITE_DATA_FILE).resolve()),
+            "path": str(TRANSCRIPTS_SQLITE_PATH.resolve()),
             "exists": sqlite_exists,
-            "count": _entry_count_from_sqlite(SQLITE_DATA_FILE),
+            "count": _entry_count_from_sqlite(TRANSCRIPTS_SQLITE_PATH),
             "fts_enabled": bool(getattr(store, "fts_enabled", False)) if active_backend == "sqlite" else False,
         },
     }
 
 
 def _system_status() -> dict[str, Any]:
-    settings = load_system_settings()
+    settings = load_system_settings(SYSTEM_SETTINGS_PATH)
     return {
         "settings": settings,
         "backend": {
@@ -310,8 +330,8 @@ def _system_status() -> dict[str, Any]:
 
 def _mcp_status() -> dict[str, Any]:
     config_path = Path(".mcp.json").resolve()
-    settings_path = Path(DEFAULT_MCP_SETTINGS_FILE).resolve()
-    settings = load_mcp_settings()
+    settings_path = MCP_SETTINGS_PATH.resolve()
+    settings = load_mcp_settings(MCP_SETTINGS_PATH)
     return {
         "enabled": settings["enabled"],
         "settings": settings,
@@ -328,7 +348,7 @@ def _mcp_status() -> dict[str, Any]:
 
 
 def _ensure_ingestion_allowed() -> None:
-    settings = load_system_settings()
+    settings = load_system_settings(SYSTEM_SETTINGS_PATH)
     if settings.get("maintenance_mode"):
         raise HTTPException(status_code=409, detail="Maintenance mode is enabled")
     if settings.get("ingestion_paused"):
@@ -427,7 +447,7 @@ def _write_data_export(entries: list[dict[str, Any]], request: "DataExportReques
     if export_format not in DATA_EXPORT_FORMATS:
         raise HTTPException(status_code=400, detail=f"Unsupported export format: {request.format}")
 
-    export_dir = Path(EXPORTS_DIR)
+    export_dir = EXPORTS_DIR
     export_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     scope = re.sub(r"[^a-z0-9_-]+", "-", (request.scope or "all").lower()).strip("-") or "all"
@@ -959,7 +979,7 @@ def watcher_due(settings: dict[str, Any]) -> bool:
 def watcher_worker_loop():
     while not watcher_stop_event.is_set():
         settings = reliability_store.get_settings()
-        system_settings = load_system_settings()
+        system_settings = load_system_settings(SYSTEM_SETTINGS_PATH)
         worker_paused = system_settings.get("ingestion_paused") or system_settings.get("maintenance_mode")
         if not worker_paused and watcher_due(settings) and task_status.get("current_task") is None:
             try:
@@ -1137,8 +1157,15 @@ def get_storage_status():
 def migrate_storage_to_sqlite():
     global store
 
-    json_path = Path(DATA_FILE)
-    sqlite_path = Path(SQLITE_DATA_FILE)
+    json_path = TRANSCRIPTS_JSON_PATH
+    sqlite_path = TRANSCRIPTS_SQLITE_PATH
+
+    if isinstance(store, SQLiteTranscriptStore):
+        return {
+            "status": "already_active",
+            "message": "SQLite storage is already active; the JSON archive was not imported.",
+            "storage": _storage_status(),
+        }
 
     if not json_path.exists() and not isinstance(store, SQLiteTranscriptStore):
         raise HTTPException(status_code=404, detail="No JSON transcript store found")
@@ -1162,7 +1189,7 @@ def migrate_storage_to_sqlite():
 @app.post("/api/storage/export-json")
 def export_storage_json():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_path = Path(EXPORTS_DIR) / f"transcripts_export_{timestamp}.json"
+    export_path = EXPORTS_DIR / f"transcripts_export_{timestamp}.json"
 
     try:
         written_path = export_entries_to_json(store.all_entries(), export_path)
@@ -1221,7 +1248,7 @@ def get_mcp_status():
 
 @app.put("/api/mcp/settings")
 def update_mcp_status(request: MCPSettingsRequest):
-    settings = update_mcp_settings(request_payload(request), DEFAULT_MCP_SETTINGS_FILE)
+    settings = update_mcp_settings(request_payload(request), MCP_SETTINGS_PATH)
     record_event("success", "mcp_settings_updated", "Updated MCP settings", {
         "enabled": settings["enabled"],
     })
@@ -1235,7 +1262,7 @@ def get_system_status():
 
 @app.put("/api/system/settings")
 def update_system_status(request: SystemSettingsRequest):
-    settings = update_system_settings(request_payload(request), DEFAULT_SYSTEM_SETTINGS_FILE)
+    settings = update_system_settings(request_payload(request), SYSTEM_SETTINGS_PATH)
     record_event("success", "system_settings_updated", "Updated system controls", settings)
     return _system_status()
 
@@ -1569,7 +1596,7 @@ def build_ai_timeline(request: AITimelineRequest):
 @app.get("/api/ai/embeddings/status")
 def get_embeddings_status():
     settings = ai_settings_store.get_settings()
-    index = load_semantic_index(DEFAULT_INDEX_PATH)
+    index = load_semantic_index(str(SEMANTIC_INDEX_PATH))
     items = index.get("items") or []
     stale_ids = stale_transcript_ids(
         store.all_entries(),
@@ -1578,7 +1605,7 @@ def get_embeddings_status():
     )
     return {
         "exists": bool(items),
-        "path": str(Path(DEFAULT_INDEX_PATH).resolve()),
+        "path": str(SEMANTIC_INDEX_PATH.resolve()),
         "embedding_model": index.get("embedding_model") or settings.get("embedding_model"),
         "chunk_count": len(items),
         "stale_count": len(stale_ids),
@@ -1618,7 +1645,7 @@ def rebuild_ai_embeddings(request: EmbeddingsRebuildRequest):
         index = rebuild_semantic_index(
             entries,
             embed_text,
-            path=DEFAULT_INDEX_PATH,
+            path=str(SEMANTIC_INDEX_PATH),
             embedding_model=settings["embedding_model"],
             segments_per_chunk=max(1, int(request.segments_per_chunk or 8)),
             segment_overlap=max(0, int(request.segment_overlap or 0)),
@@ -1627,7 +1654,7 @@ def rebuild_ai_embeddings(request: EmbeddingsRebuildRequest):
         finish_task("Semantic index rebuilt")
         return {
             "status": "success",
-            "path": str(Path(DEFAULT_INDEX_PATH).resolve()),
+            "path": str(SEMANTIC_INDEX_PATH.resolve()),
             "embedding_model": index.get("embedding_model"),
             "chunk_count": len(index.get("items") or []),
             "video_count": len(entries),
@@ -1650,7 +1677,7 @@ def semantic_search(q: str, limit: int = 10):
         return {"results": [], "message": "Search query is too short"}
 
     settings = ai_settings_store.get_settings()
-    index = load_semantic_index(DEFAULT_INDEX_PATH)
+    index = load_semantic_index(str(SEMANTIC_INDEX_PATH))
     if not index.get("items"):
         return {
             "results": [],
@@ -1950,8 +1977,7 @@ def background_channel_fetch(url: str, run_id: str | None = None):
             raise ValueError("No videos found")
         
         # Create a export folder for this bulk run
-        CHANNELS_DIR = "channels"
-        folder = os.path.join(CHANNELS_DIR, f"Bulk_Export_{int(time.time())}")
+        folder = CHANNELS_DIR / f"Bulk_Export_{int(time.time())}"
         os.makedirs(folder, exist_ok=True)
 
         for i, v in enumerate(videos, 1):
