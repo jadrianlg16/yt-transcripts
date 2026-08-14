@@ -321,6 +321,95 @@ Then, in rough value order:
 7. **Retire `app.py`.** The legacy Tkinter app duplicates fetch logic that has now
    diverged from `main.py` (no dedupe, no deep listing, no backoff).
 
+## Stage 9: The Retrieval Contract
+
+Sourced from the archive itself — Nate B Jones, "Pinecone Just Demoted Vector Search.
+Here's the Knowledge Layer." (`lqiwQiDglGk`), plus "Paste This Into Claude, Never Hit a
+Token Limit Again" (`Y8vAQ1FgNbM`) and "Anthropic Just Gave Your AI Agent the One Thing
+OpenClaw Has" (`vqnAOV8NMZ4`).
+
+His argument, compressed: classic RAG (chunk → embed → top-k) was built for chatbot
+question answering, where the answer lives in a couple of paragraphs. Agents don't ask a
+question and stop; they run a task, and they need a *bundle* assembled in the right shape.
+The retrieval unit has to match the work. Bigger context windows do not fix this — they
+give the model more room but do not decide what belongs in the room ("context rot"). His
+build order is: define the retrieval contract, write down the bundle field by field, then
+choose primitives that deliver it. Never database-first.
+
+Measured against that, this project is a chatbot-era retrieval system serving agent-era
+requests.
+
+### 9.1 Cap what `fetch` returns, and return passages instead of documents
+
+The MCP `fetch` tool returns `entry["transcript"]` uncapped, while every neighbouring
+tool routes through `_cap_text`. At the current archive that is ~5,600 tokens for an
+average video and ~11,300 for the largest. **A ten-video research question costs roughly
+96,000 tokens of raw transcript**, most of it irrelevant to the question asked. This is
+precisely the reused-input problem from `Y8vAQ1FgNbM`, reproduced inside an archive of
+that video.
+
+Two changes, in order of value:
+
+- Cap `fetch` like the others (small).
+- Add a passage-level retrieval tool: return the N matching windows with their
+  timestamps and video ids, not the document. The segment data already exists; this is a
+  retrieval-shape change, not new storage.
+
+Keep whole-document `fetch` available — it is the correct unit when the agent has already
+decided a specific video is the subject. It is the wrong *default*.
+
+### 9.2 Name the retrieval unit for each question type
+
+The archive's natural shapes, and which already exist:
+
+| Question | Right unit | Status |
+| --- | --- | --- |
+| "Where does he say X?" | passage + timestamp | segments stored, not exposed as a unit |
+| "What is video Y about?" | compiled brief | AI summaries exist, not reachable over MCP |
+| "How did his view on X change?" | ordered claims across videos | timeline exists in the UI only |
+| "What connects X to Y?" | entity/topic neighbourhood | not built |
+
+The gap is not storage. It is that the useful units are trapped behind the UI while MCP
+only offers document-shaped tools.
+
+### 9.3 Vector storage: `sqlite-vec`, not a vector database
+
+`semantic_index.json` is loaded whole and scored with brute-force cosine in Python. Fine
+at 76 transcripts, wrong by a few thousand. The move is the `sqlite-vec` extension: it
+keeps the single-file, no-extra-service architecture the project already has and adds
+ANN in place.
+
+Explicitly **not** Pinecone/Weaviate/Chroma-as-a-service. Adding a hosted vector database
+to a local personal archive is the shopping-spree failure `lqiwQiDglGk` warns about — the
+retrieval contract here does not need it.
+
+### 9.4 Mark provenance before derived data accumulates
+
+`lqiwQiDglGk` names the failure mode directly: an agent can store its own inference as a
+confirmed fact and quietly poison later runs. This archive is about to mix two very
+different classes of data — transcript text, which is ground truth about what was said,
+and model-generated summaries and tags, which are inference.
+
+Every retrieval result should carry which one it is. Doing this now is a field on a
+response; doing it after a few thousand artifacts exist is a migration.
+
+### 9.5 Instrument retrieval
+
+"The cheapest place to learn what you need is your own work logs." There is rich
+telemetry for *fetching* (`fetch_runs`, `backend_events`) and none for *retrieval*. Worth
+recording per MCP call: tokens returned, whether the same video was fetched twice in a
+session, and how many calls happen before the agent stops searching. Those numbers decide
+whether 9.2 and 9.3 are worth building, instead of guessing.
+
+### Out of scope, deliberately
+
+- KV-cache compression (TurboQuant, `erV_8yrGMA8`) is model-infrastructure, nothing to
+  act on here.
+- Cross-tool context portability / BYOC (`4KAF72BTyCE`) is a much larger product idea
+  than this archive. Worth noting that a local SQLite store behind MCP is already the
+  shape he recommends for owning your own memory ("OpenBrain", `vqnAOV8NMZ4`) — this
+  project is an instance of that pattern, not a candidate for replacing it.
+
 ## Session Log: 2026-08-14
 
 - Bulk channel fetch was capped at 15 videos because RSS returns only the 15 newest
