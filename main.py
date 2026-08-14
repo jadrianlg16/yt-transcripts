@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from core.store import DATA_FILE, SQLITE_DATA_FILE, TranscriptRepository, create_transcript_store
+from core.channel_listing import list_channel_videos
 from core.fetcher import extract_video_id, fetch_video_full
 from core.fetch_reliability import DEFAULT_RELIABILITY_FILE, FetchReliabilityStore, youtube_watch_url
 from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationStore, utc_now
@@ -240,6 +241,14 @@ def transcript_lookup() -> dict[str, dict[str, Any]]:
         for entry in store.all_entries()
         if entry.get("video_id")
     }
+
+
+def saved_video_ids() -> set[str]:
+    """Existing video ids only. Avoids loading every transcript just to dedupe."""
+    reader = getattr(store, "saved_video_ids", None)
+    if callable(reader):
+        return reader()
+    return set(transcript_lookup())
 
 
 def require_transcript(video_id: str) -> dict[str, Any]:
@@ -809,6 +818,42 @@ def _fetch_and_save_video(
     return entry
 
 
+# YouTube starts refusing transcript requests after a burst. Backing off and then
+# stopping the run beats burning through the rest of the list collecting failures:
+# whatever is left stays unfetched, so the next run picks it up as new.
+RATE_LIMIT_BACKOFF_SECONDS = (30, 90, 180)
+RATE_LIMIT_MARKERS = ("blocking requests", "too many requests", "429")
+
+
+def _is_rate_limited(error: Exception | str) -> bool:
+    from youtube_transcript_api._errors import IpBlocked, RequestBlocked
+
+    if isinstance(error, (IpBlocked, RequestBlocked)):
+        return True
+    text = str(error).lower()
+    return any(marker in text for marker in RATE_LIMIT_MARKERS)
+
+
+def _rate_limit_pause(consecutive: int, run_id: str) -> bool:
+    """Sleep through a rate-limit streak. Returns False once the run should give up."""
+    if consecutive > len(RATE_LIMIT_BACKOFF_SECONDS):
+        return False
+
+    delay = RATE_LIMIT_BACKOFF_SECONDS[consecutive - 1]
+    update_task_status(message=f"YouTube is rate limiting. Waiting {delay}s before retrying...")
+    record_event("warning", "fetch_rate_limited", f"Rate limited; backing off {delay}s", {
+        "run_id": run_id,
+        "consecutive": consecutive,
+        "delay_seconds": delay,
+    })
+
+    for _ in range(delay):
+        if _task_cancel_requested():
+            return False
+        time.sleep(1)
+    return True
+
+
 def _record_fetch_failure(
     run_id: str,
     error: Exception | str,
@@ -927,43 +972,201 @@ def fetch_channel_rss_entries(channel: str) -> list[dict[str, str]]:
     return parse_youtube_rss_entries(xml_text)
 
 
-def fetch_channel_video_candidates(channel_url: str) -> tuple[list[dict[str, str]], str]:
+# YouTube's RSS feed always returns the 15 newest uploads and nothing older, so it
+# is only enough for incremental "what is new since last time" checks. Anything
+# deeper has to come from the paginated browse listing that scrapetube walks.
+RSS_FEED_DEPTH = 15
+DEFAULT_CHANNEL_FETCH_LIMIT = 30
+MAX_CHANNEL_FETCH_LIMIT = 500
+
+
+def _scrapetube_title(video: dict[str, Any]) -> str:
+    title = video.get("title")
+    if isinstance(title, dict):
+        runs = title.get("runs")
+        if isinstance(runs, list) and runs:
+            return str(runs[0].get("text") or "").strip()
+        return str(title.get("simpleText") or "").strip()
+    return str(title or "").strip()
+
+
+def _scrapetube_published(video: dict[str, Any]) -> str:
+    if video.get("published_text"):
+        return str(video["published_text"]).strip()
+    published = video.get("publishedTimeText")
+    if isinstance(published, dict):
+        return str(published.get("simpleText") or "").strip()
+    return str(published or "").strip()
+
+
+def _normalize_candidate(video: dict[str, Any]) -> dict[str, str] | None:
+    video_id = str(video.get("videoId") or video.get("video_id") or "").strip()
+    if not video_id:
+        return None
+    return {
+        "videoId": video_id,
+        "title": _scrapetube_title(video) or str(video.get("title") or ""),
+        "url": str(video.get("url") or "") or youtube_watch_url(video_id) or "",
+        "published_text": _scrapetube_published(video),
+    }
+
+
+def _dedupe_candidates(videos: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for video in videos:
+        video_id = video["videoId"]
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+        unique.append(video)
+    return unique
+
+
+def _channel_page_candidates(channel_url: str, limit: int | None) -> tuple[list[dict[str, str]], str]:
+    """Read the channel page grid directly. This is the only source that pages deep."""
+    videos = list_channel_videos(channel_url, limit=limit)
+    return [c for c in (_normalize_candidate(v) for v in videos) if c], "channel_page"
+
+
+def _scrapetube_candidates(channel_url: str, limit: int | None) -> tuple[list[dict[str, str]], str]:
+    """Walk the channel's browse listing, newest first, across videos and streams."""
     errors: list[str] = []
+    handle = channel_url.split("@")[-1].split("/")[0] if "@" in channel_url else None
+    lookups: list[tuple[str, dict[str, Any]]] = [("scrapetube:url", {"channel_url": channel_url})]
+    if handle:
+        lookups.append(("scrapetube:handle", {"channel_username": handle}))
 
-    try:
-        entries = fetch_channel_rss_entries(channel_url)
-        videos = [
-            {
-                "videoId": entry["video_id"],
-                "title": entry.get("title", ""),
-                "url": entry.get("url") or youtube_watch_url(entry["video_id"]) or "",
-            }
-            for entry in entries
-        ]
-        if videos:
-            return videos, "rss"
-    except Exception as exc:
-        errors.append(f"RSS lookup failed: {exc}")
+    for source, kwargs in lookups:
+        collected: list[dict[str, str]] = []
+        used_types: list[str] = []
+        for content_type in ("videos", "streams"):
+            remaining = None if limit is None else limit - len(collected)
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                videos = list(
+                    scrapetube.get_channel(
+                        **kwargs,
+                        limit=remaining,
+                        sort_by="newest",
+                        content_type=content_type,
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"{source}/{content_type} lookup failed: {exc}")
+                continue
+            normalized = [c for c in (_normalize_candidate(v) for v in videos) if c]
+            if normalized:
+                used_types.append(content_type)
+                collected.extend(normalized)
 
-    try:
-        videos = list(scrapetube.get_channel(channel_url=channel_url))
-        if videos:
-            return videos, "scrapetube:url"
-    except Exception as exc:
-        errors.append(f"scrapetube url lookup failed: {exc}")
-
-    if "@" in channel_url:
-        handle = channel_url.split("@")[-1].split("/")[0]
-        try:
-            videos = list(scrapetube.get_channel(channel_username=handle))
-            if videos:
-                return videos, "scrapetube:handle"
-        except Exception as exc:
-            errors.append(f"scrapetube handle lookup failed: {exc}")
+        if collected:
+            return _dedupe_candidates(collected), f"{source}:{'+'.join(used_types)}"
 
     if errors:
         raise ValueError("; ".join(errors))
     return [], "none"
+
+
+def fetch_channel_video_candidates(
+    channel_url: str,
+    limit: int | None = None,
+) -> tuple[list[dict[str, str]], str]:
+    """List a channel's newest videos.
+
+    RSS is preferred while the caller only wants the 15 newest uploads because it is a
+    single cheap request. Deeper requests skip straight to the browse listing, which is
+    the only source that pages past that cap.
+    """
+    errors: list[str] = []
+    wants_deep_listing = limit is None or limit > RSS_FEED_DEPTH
+
+    if not wants_deep_listing:
+        try:
+            entries = fetch_channel_rss_entries(channel_url)
+            videos = [
+                {
+                    "videoId": entry["video_id"],
+                    "title": entry.get("title", ""),
+                    "url": entry.get("url") or youtube_watch_url(entry["video_id"]) or "",
+                    "published_text": "",
+                }
+                for entry in entries
+            ]
+            if videos:
+                return videos[:limit], "rss"
+        except Exception as exc:
+            errors.append(f"RSS lookup failed: {exc}")
+
+    try:
+        videos, source = _channel_page_candidates(channel_url, limit)
+        if videos:
+            return videos, source
+    except Exception as exc:
+        errors.append(f"channel page lookup failed: {exc}")
+
+    try:
+        videos, source = _scrapetube_candidates(channel_url, limit)
+        if videos:
+            return videos, source
+    except Exception as exc:
+        errors.append(str(exc))
+
+    # Deep listing failed; the 15 newest are better than nothing.
+    if wants_deep_listing:
+        try:
+            entries = fetch_channel_rss_entries(channel_url)
+            videos = [
+                {
+                    "videoId": entry["video_id"],
+                    "title": entry.get("title", ""),
+                    "url": entry.get("url") or youtube_watch_url(entry["video_id"]) or "",
+                    "published_text": "",
+                }
+                for entry in entries
+            ]
+            if videos:
+                return videos, "rss:fallback"
+        except Exception as exc:
+            errors.append(f"RSS fallback failed: {exc}")
+
+    if errors:
+        raise ValueError("; ".join(errors))
+    return [], "none"
+
+
+def plan_channel_fetch(
+    channel_url: str,
+    limit: int | None = None,
+    skip_existing: bool = True,
+) -> dict[str, Any]:
+    """List a channel's recent titles and mark which ones the archive already holds."""
+    videos, listing_source = fetch_channel_video_candidates(channel_url, limit=limit)
+    saved_ids = saved_video_ids()
+
+    candidates = []
+    for video in videos:
+        video_id = video["videoId"]
+        already_saved = video_id in saved_ids
+        candidates.append({
+            "video_id": video_id,
+            "title": video.get("title") or video_id,
+            "url": video.get("url") or youtube_watch_url(video_id),
+            "published_text": video.get("published_text", ""),
+            "already_saved": already_saved,
+            "selected": not (already_saved and skip_existing),
+        })
+
+    new_count = sum(1 for c in candidates if not c["already_saved"])
+    return {
+        "channel": channel_url,
+        "listing_source": listing_source,
+        "total": len(candidates),
+        "new_count": new_count,
+        "already_saved_count": len(candidates) - new_count,
+        "candidates": candidates,
+    }
 
 
 def watcher_due(settings: dict[str, Any]) -> bool:
@@ -1012,6 +1215,21 @@ def root():
 
 class FetchRequest(BaseModel):
     url: str
+
+
+class ChannelFetchRequest(BaseModel):
+    url: str
+    # How deep to walk the channel listing. Above 15 this leaves RSS behind.
+    limit: Optional[int] = DEFAULT_CHANNEL_FETCH_LIMIT
+    skip_existing: bool = True
+    # Explicit picks from the preview screen; overrides listing order when set.
+    video_ids: Optional[List[str]] = None
+
+
+class ChannelPreviewRequest(BaseModel):
+    url: str
+    limit: Optional[int] = DEFAULT_CHANNEL_FETCH_LIMIT
+    skip_existing: bool = True
 
 
 class RetryFailedRequest(BaseModel):
@@ -1185,6 +1403,24 @@ def migrate_storage_to_sqlite():
         "message": "SQLite storage is active",
         "storage": status,
     }
+
+@app.post("/api/storage/normalize-channels")
+def normalize_storage_channels():
+    """One-off cleanup for archives written before channel names were normalised."""
+    normalizer = getattr(store, "normalize_channel_names", None)
+    if not callable(normalizer):
+        raise HTTPException(status_code=400, detail="Active storage backend cannot normalize channels")
+
+    try:
+        result = normalizer()
+    except Exception as exc:
+        logger.exception("Channel normalization failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    message = f"Renamed {result['renamed']} channels and merged {result['merged']} duplicates."
+    record_event("info", "channels_normalized", message, result)
+    return {"status": "success", "message": message, **result}
+
 
 @app.post("/api/storage/export-json")
 def export_storage_json():
@@ -1957,28 +2193,72 @@ def fetch_video(request: FetchRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(background_video_fetch, request.url, run_id)
     return {"status": "started", "run_id": run_id}
 
-def background_channel_fetch(url: str, run_id: str | None = None):
+def background_channel_fetch(
+    url: str,
+    run_id: str | None = None,
+    limit: int | None = DEFAULT_CHANNEL_FETCH_LIMIT,
+    skip_existing: bool = True,
+    video_ids: list[str] | None = None,
+):
     global task_status
     run_id = begin_task("channel", "Finding videos in channel...", run_id=run_id)
     reliability_store.start_run("channel", url, total=0, run_id=run_id)
     try:
-        videos, listing_source = fetch_channel_video_candidates(url)
+        videos, listing_source = fetch_channel_video_candidates(url, limit=limit)
+        listed_count = len(videos)
+
+        # An explicit selection (from the preview screen) wins over the listing order.
+        if video_ids:
+            wanted = set(video_ids)
+            known = {v["videoId"] for v in videos}
+            videos = [v for v in videos if v["videoId"] in wanted]
+            for missing_id in video_ids:
+                if missing_id not in known:
+                    videos.append({
+                        "videoId": missing_id,
+                        "title": "",
+                        "url": youtube_watch_url(missing_id) or "",
+                    })
+
+        already_saved_count = 0
+        if skip_existing:
+            existing_ids = saved_video_ids()
+            kept = [v for v in videos if v["videoId"] not in existing_ids]
+            already_saved_count = len(videos) - len(kept)
+            videos = kept
+
         total = len(videos)
-        update_task_status(total=total, progress=0, message=f"Found {total} videos via {listing_source}")
+        summary = (
+            f"Found {listed_count} videos via {listing_source}; "
+            f"{already_saved_count} already archived, fetching {total}"
+        )
+        update_task_status(total=total, progress=0, message=summary)
         reliability_store.set_total(run_id, total)
-        record_event("info", "channel_videos_found", f"Found {total} channel videos via {listing_source}", {
+        record_event("info", "channel_videos_found", summary, {
             "run_id": run_id,
             "url": url,
+            "listed": listed_count,
+            "already_saved": already_saved_count,
             "total": total,
             "source": listing_source,
+            "limit": limit,
         })
-        
-        if total == 0:
+
+        if listed_count == 0:
             raise ValueError("No videos found")
-        
+
+        if total == 0:
+            message = f"Channel already up to date. All {already_saved_count} listed videos are archived."
+            finish_task(message)
+            reliability_store.finish_run(run_id, message=message)
+            return
+
         # Create a export folder for this bulk run
         folder = CHANNELS_DIR / f"Bulk_Export_{int(time.time())}"
         os.makedirs(folder, exist_ok=True)
+
+        rate_limit_streak = 0
+        stopped_early = 0
 
         for i, v in enumerate(videos, 1):
             if _task_cancel_requested():
@@ -1988,13 +2268,14 @@ def background_channel_fetch(url: str, run_id: str | None = None):
             v_id = v['videoId']
             update_task_status(progress=i, message=f"Processing video {i}/{total}: {v_id}")
             source_url = v.get("url") or youtube_watch_url(v_id)
-            
+
             # Check if exists in folder already (though we use time-stamped folders now)
-            
+
             try:
                 time.sleep(random.uniform(1, 3)) # politeness
                 entry = _fetch_and_save_video(v_id, run_id=run_id, index=i, total=total, url=source_url)
-                
+                rate_limit_streak = 0
+
                 # Save to individual JSON
                 with open(os.path.join(folder, f"{v_id}.json"), "w", encoding="utf-8") as f:
                     json.dump(entry, f, indent=2, ensure_ascii=False)
@@ -2030,21 +2311,32 @@ def background_channel_fetch(url: str, run_id: str | None = None):
                     "total": total,
                     "error": str(exc),
                 })
+
+                if _is_rate_limited(exc):
+                    rate_limit_streak += 1
+                    if not _rate_limit_pause(rate_limit_streak, run_id):
+                        # Leave the rest unfetched so the next run picks them up as new.
+                        stopped_early = total - i
+                        break
+                else:
+                    rate_limit_streak = 0
                 continue
-        
-        finish_task(
+
+        message = (
             "Bulk fetch finished. "
-            f"Saved {task_status['success_count']} of {total}; "
-            f"skipped {task_status['skipped_count']}."
+            f"Saved {task_status['success_count']} of {total} new; "
+            f"failed {task_status['skipped_count']}; "
+            f"already archived {already_saved_count}."
         )
-        reliability_store.finish_run(
-            run_id,
-            message=(
-                "Bulk fetch finished. "
-                f"Saved {task_status['success_count']} of {total}; "
-                f"skipped {task_status['skipped_count']}."
-            ),
-        )
+        if stopped_early:
+            message = (
+                f"Stopped early: YouTube is rate limiting. "
+                f"Saved {task_status['success_count']}; "
+                f"{stopped_early} left for a later run; "
+                f"already archived {already_saved_count}."
+            )
+        finish_task(message)
+        reliability_store.finish_run(run_id, message=message)
     except Exception as e:
         logger.exception("Channel fetch failed")
         update_task_status(message=f"Error: {str(e)}", failure_count=task_status["failure_count"] + 1)
@@ -2056,11 +2348,40 @@ def background_channel_fetch(url: str, run_id: str | None = None):
         })
         finish_task(f"Error: {str(e)}", level="error")
 
+def _channel_fetch_limit(value: int | None) -> int | None:
+    """None means 'walk the whole channel'; anything else is clamped to a sane range."""
+    if value is None or value <= 0:
+        return None
+    return min(int(value), MAX_CHANNEL_FETCH_LIMIT)
+
+
+@app.post("/api/fetch/channel/preview")
+def preview_channel(request: ChannelPreviewRequest):
+    """List recent channel titles and flag which are already in the archive."""
+    try:
+        return plan_channel_fetch(
+            request.url,
+            limit=_channel_fetch_limit(request.limit),
+            skip_existing=request.skip_existing,
+        )
+    except Exception as exc:
+        logger.exception("Channel preview failed")
+        record_event("warning", "channel_preview_failed", str(exc), {"url": request.url})
+        raise HTTPException(status_code=502, detail=f"Could not list channel videos: {exc}")
+
+
 @app.post("/api/fetch/channel")
-def fetch_channel(request: FetchRequest, background_tasks: BackgroundTasks):
+def fetch_channel(request: ChannelFetchRequest, background_tasks: BackgroundTasks):
     _ensure_ingestion_allowed()
     run_id = queue_task("channel", "Channel fetch queued...", total=0)
-    background_tasks.add_task(background_channel_fetch, request.url, run_id)
+    background_tasks.add_task(
+        background_channel_fetch,
+        request.url,
+        run_id,
+        _channel_fetch_limit(request.limit),
+        request.skip_existing,
+        request.video_ids,
+    )
     return {"status": "started", "run_id": run_id}
 
 

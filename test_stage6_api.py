@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -85,9 +86,14 @@ class Stage6ApiTests(unittest.TestCase):
         main.backend_events.clear()
         main.backend_event_id = 0
         reset_task_status()
+        # Resolved at import time, so chdir alone does not isolate it when
+        # YT_TRANSCRIPTS_DATA_DIR points at a real data directory.
+        self.semantic_index_path = main.SEMANTIC_INDEX_PATH
+        main.SEMANTIC_INDEX_PATH = Path(self.temp_dir.name) / "semantic_index.json"
         self.client = TestClient(main.app)
 
     def tearDown(self):
+        main.SEMANTIC_INDEX_PATH = self.semantic_index_path
         os.chdir(self.cwd)
         self.temp_dir.cleanup()
 

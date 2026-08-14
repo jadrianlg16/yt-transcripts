@@ -1,17 +1,32 @@
 import html
 import json
 import os
+import re
 from typing import Any, Dict, List, Protocol
 
 DATA_FILE = "transcripts_store.json"
 SQLITE_DATA_FILE = "transcripts_store.sqlite3"
+
+_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def normalize_display_text(value: Any) -> str:
+    """Undo the escaping YouTube's embedded JSON leaves in titles and channel names.
+
+    Older archives stored channel names verbatim, so ``&`` survives as the literal
+    text ``\\u0026`` and splits one channel into two.
+    """
+    text = str(value)
+    if "\\u" in text:
+        text = _UNICODE_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), text)
+    return html.unescape(text.replace("\\/", "/")).strip()
 
 
 def normalize_entry_display_fields(entry: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(entry)
     for key in ("title", "channel"):
         if normalized.get(key) is not None:
-            normalized[key] = html.unescape(str(normalized[key]))
+            normalized[key] = normalize_display_text(normalized[key])
     return normalized
 
 
@@ -62,6 +77,9 @@ class JsonTranscriptStore:
 
     def all_entries(self):
         return self.data
+
+    def saved_video_ids(self):
+        return {str(e.get("video_id")) for e in self.data if e.get("video_id")}
 
 
 class TranscriptStore(JsonTranscriptStore):

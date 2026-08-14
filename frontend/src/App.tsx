@@ -247,6 +247,24 @@ interface FetchRun {
   metadata?: Record<string, unknown>;
 }
 
+interface ChannelCandidate {
+  video_id: string;
+  title: string;
+  url: string;
+  published_text: string;
+  already_saved: boolean;
+  selected: boolean;
+}
+
+interface ChannelPreview {
+  channel: string;
+  listing_source: string;
+  total: number;
+  new_count: number;
+  already_saved_count: number;
+  candidates: ChannelCandidate[];
+}
+
 interface WatcherSettings {
   enabled: boolean;
   channels: string[];
@@ -839,6 +857,10 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [videoUrl, setVideoUrl] = useState('');
   const [channelUrl, setChannelUrl] = useState('');
+  const [channelLimit, setChannelLimit] = useState('30');
+  const [channelPreview, setChannelPreview] = useState<ChannelPreview | null>(null);
+  const [channelPreviewBusy, setChannelPreviewBusy] = useState(false);
+  const [selectedCandidates, setSelectedCandidates] = useState<string[]>([]);
   const [channelFilter, setChannelFilter] = useState('all');
   const [status, setStatus] = useState<TaskStatus>({ current_task: null, progress: 0, total: 0, message: 'Idle' });
   const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
@@ -1458,12 +1480,53 @@ function App() {
     }
   };
 
-  const handleFetchChannel = async () => {
+  const parsedChannelLimit = () => {
+    const value = Number.parseInt(channelLimit, 10);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  };
+
+  const handlePreviewChannel = async () => {
+    if (!channelUrl.trim() || channelPreviewBusy) return;
+    setChannelPreviewBusy(true);
+    try {
+      addLog(`Listing recent videos for channel: ${channelUrl}`, 'info');
+      const res = await axios.post<ChannelPreview>(`${API_BASE}/fetch/channel/preview`, {
+        url: channelUrl,
+        limit: parsedChannelLimit(),
+        skip_existing: true,
+      });
+      markApiOnline();
+      setChannelPreview(res.data);
+      setSelectedCandidates(res.data.candidates.filter(item => item.selected).map(item => item.video_id));
+      addLog(
+        `Listed ${res.data.total} videos via ${res.data.listing_source}: ${res.data.new_count} new, ${res.data.already_saved_count} already archived`,
+        'success',
+      );
+    } catch (error) {
+      reportApiError('Failed to list channel videos', error);
+    } finally {
+      setChannelPreviewBusy(false);
+    }
+  };
+
+  const toggleCandidate = (videoId: string) => {
+    setSelectedCandidates(prev =>
+      prev.includes(videoId) ? prev.filter(id => id !== videoId) : [...prev, videoId],
+    );
+  };
+
+  const handleFetchChannel = async (videoIds?: string[]) => {
     if (!channelUrl.trim() || fetchRequestBusy || status.current_task) return;
     setFetchRequestBusy(true);
     try {
-      addLog(`Starting bulk fetch for channel: ${channelUrl}`, 'info');
-      const res = await axios.post(`${API_BASE}/fetch/channel`, { url: channelUrl });
+      const scope = videoIds?.length ? `${videoIds.length} selected videos` : `latest ${channelLimit || 'all'}`;
+      addLog(`Starting bulk fetch for channel: ${channelUrl} (${scope})`, 'info');
+      const res = await axios.post(`${API_BASE}/fetch/channel`, {
+        url: channelUrl,
+        limit: parsedChannelLimit(),
+        skip_existing: true,
+        video_ids: videoIds?.length ? videoIds : null,
+      });
       markApiOnline();
       setStatus(prev => ({
         ...prev,
@@ -1477,7 +1540,8 @@ function App() {
         skipped_count: 0,
       }));
       addLog('Channel fetch accepted by backend', 'success', res.data);
-      setChannelUrl('');
+      setChannelPreview(null);
+      setSelectedCandidates([]);
     } catch (error) {
       reportApiError('Failed to trigger channel fetch', error);
     } finally {
@@ -2392,15 +2456,94 @@ function App() {
             value={channelUrl}
             onChange={(event) => setChannelUrl(event.target.value)}
           />
-          <button onClick={handleFetchChannel} disabled={!channelUrl.trim() || fetchRequestBusy || Boolean(status.current_task)} className={`${secondaryButtonClass} sm:w-32`}>
+          <input
+            type="number"
+            min={1}
+            max={500}
+            placeholder="30"
+            title="How many recent videos to list. Blank walks the whole channel."
+            className={`${fieldClass} sm:w-24`}
+            value={channelLimit}
+            onChange={(event) => setChannelLimit(event.target.value)}
+          />
+          <button onClick={handlePreviewChannel} disabled={!channelUrl.trim() || channelPreviewBusy} className={`${secondaryButtonClass} sm:w-32`}>
+            <ListPlus className={`h-4 w-4 ${channelPreviewBusy ? 'animate-spin' : ''}`} />
+            {channelPreviewBusy ? 'Listing' : 'Preview'}
+          </button>
+          <button onClick={() => handleFetchChannel()} disabled={!channelUrl.trim() || fetchRequestBusy || Boolean(status.current_task)} className={`${secondaryButtonClass} sm:w-32`}>
             <RefreshCw className={`h-4 w-4 ${fetchRequestBusy || status.current_task === 'channel' ? 'animate-spin' : ''}`} />
             {fetchRequestBusy || status.current_task === 'channel' ? 'Starting' : 'Bulk'}
           </button>
         </div>
       </div>
+      {renderChannelPreview()}
       <div className="mt-3">{renderActiveTask()}</div>
     </section>
   );
+
+  const renderChannelPreview = () => {
+    if (!channelPreview) return null;
+    const newSelected = selectedCandidates.length;
+
+    return (
+      <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm text-slate-700">
+            <span className="font-semibold text-slate-950">{channelPreview.total} listed</span>
+            {' · '}
+            <span className="text-emerald-700">{channelPreview.new_count} new</span>
+            {' · '}
+            <span className="text-slate-500">{channelPreview.already_saved_count} already archived</span>
+            {' · '}
+            <span className="text-slate-400">via {channelPreview.listing_source}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedCandidates(channelPreview.candidates.filter(item => !item.already_saved).map(item => item.video_id))}
+              className={secondaryButtonClass}
+            >
+              Select new
+            </button>
+            <button
+              onClick={() => handleFetchChannel(selectedCandidates)}
+              disabled={newSelected === 0 || fetchRequestBusy || Boolean(status.current_task)}
+              className={primaryButtonClass}
+            >
+              <Download className="h-4 w-4" />
+              Fetch {newSelected}
+            </button>
+            <button onClick={() => { setChannelPreview(null); setSelectedCandidates([]); }} className={iconButtonClass} title="Close preview">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <ul className="mt-3 max-h-72 space-y-1 overflow-y-auto">
+          {channelPreview.candidates.map(item => (
+            <li key={item.video_id} className="flex items-start gap-2 rounded-md bg-white px-2 py-1.5 text-sm">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={selectedCandidates.includes(item.video_id)}
+                onChange={() => toggleCandidate(item.video_id)}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-slate-800" title={item.title}>{item.title || item.video_id}</div>
+                <div className="text-xs text-slate-500">
+                  {item.published_text && <span>{item.published_text} · </span>}
+                  {item.already_saved
+                    ? <span className="text-slate-400">already archived</span>
+                    : <span className="text-emerald-700">new</span>}
+                </div>
+              </div>
+              <a href={item.url} target="_blank" rel="noreferrer" className={iconButtonClass} title="Open on YouTube">
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  };
 
   const renderSearchControls = () => (
     <section className={`${panelClass} p-4`}>

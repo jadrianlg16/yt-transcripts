@@ -19,7 +19,7 @@ The existing **YouTube Transcripts** card starts this Compose stack and opens
 so container rebuilds and recreations keep the SQLite archive.
 
 The browser uses the frontend as its only public entry point. Nginx forwards
-`/api` requests to the backend inside Docker, while port `8000` remains bound to
+`/api` requests to the backend inside Docker, while port `8014` remains bound to
 localhost for diagnostics.
 
 ### Run with Docker directly
@@ -104,11 +104,21 @@ If you prefer to run them separately:
 - **Progress Tracking:** Interactive progress bars and status labels keep you informed during long batch operations.
 - **Metadata Card:** At-a-glance view of video title, channel, video ID, and archive date.
 
-### 📥 Powerful Fetching Engine
+### 📥 Fetching Engine
 - **Single Video Fetch:** Quick archival of any YouTube URL (Videos, Shorts, etc.).
-- **Bulk Channel Fetch:** Powered by `scrapetube`, download every transcript from an entire channel automatically.
-- **Smart Deduplication:** The app automatically detects if a video has already been archived to save time and bandwidth.
-- **Stealth Mode:** Built-in random timeouts (jitter) between requests to mimic human behavior and prevent IP blocks.
+- **Channel Preview:** List a channel's recent uploads and see which titles the archive already
+  holds *before* fetching anything. Pick exactly what you want, or take everything new.
+- **Deep Channel Listing:** Reads the channel page grid and follows continuations, so a bulk
+  fetch is not capped at the 15 videos YouTube's RSS feed returns. `limit` controls the depth
+  (default 30, max 500; leave it blank to walk the whole channel).
+- **Deduplication Before Download:** Video ids already in the archive are filtered out before
+  any transcript request is made, so re-running a channel only costs one listing request.
+- **Request Pacing:** Randomised delays between videos and a fixed delay between listing pages
+  keep a bulk run from hammering YouTube.
+
+The listing tiers itself by depth: `limit` ≤ 15 uses the channel RSS feed (one cheap request),
+anything deeper reads the channel page. If one source fails the other is tried, so a YouTube
+markup change degrades the listing instead of breaking it.
 
 ### 📂 Organized Storage
 - **SQLite Database:** SQLite is the canonical runtime archive; JSON remains a portable backup/export format.
@@ -152,9 +162,10 @@ We are moving from a "Scraping Tool" to a **Personal Knowledge Engine**. Here ar
 - **Model Context Protocol (MCP):** Implementation of an MCP server to allow Claude Desktop and other AI agents to query your local transcript database directly.
 - **Local RAG:** Use semantic search (Vector DB) so you can ask AI questions like: *"Find videos where the speaker sounds skeptical about AI regulations."*
 
-### 🛡️ 3. Advanced Stealth Layer
-- **Cookie Support:** Ability to import browser cookies to mimic a logged-in user, significantly reducing the risk of 429 errors.
-- **Proxy Rotation:** Integration for residential proxies and ephemeral cloud-based fetchers (AWS Lambda/Google Cloud).
+### 🛡️ 3. Fetch Resilience
+- **Backoff On 429:** Detect rate-limit responses and pause the run instead of burning retries.
+- **Listing Health Checks:** Alert when a listing source starts returning zero videos, which is
+  the signal that YouTube changed its markup again.
 
 ### 📊 4. Multi-Source Intelligence
 - **Beyond YouTube:** Adding support for Podcasts (via OpenAI Whisper), Spotify RSS feeds, and clean web-article extraction.
@@ -164,6 +175,23 @@ We are moving from a "Scraping Tool" to a **Personal Knowledge Engine**. Here ar
 - **Clickable Timestamps:** Clicking a sentence in the transcript will open the YouTube video at the exact second the words were spoken.
 
 ---
+
+## ⚖️ Responsible Use
+
+This is a personal research archive. Read this before running it.
+
+- **No account, ever.** The app never signs in, stores cookies, or uses an API key. It reads
+  publicly available captions and public page metadata only. There is no YouTube account
+  attached to it and nothing here attempts to bypass a login, a paywall, or DRM.
+- **The archive stays local.** Transcripts belong to the people who made the videos. `data/`,
+  `channels/`, `exports/`, and both transcript stores are git-ignored on purpose. Do not commit
+  fetched transcripts, and do not republish them.
+- **Automated access is against YouTube's Terms of Service.** Google's ToS permit automated
+  access only for public search engines following `robots.txt`, with written permission, or
+  where applicable law allows. Running this tool is your decision and your responsibility.
+- **Be polite.** The default delays exist for a reason. Raising `limit` to walk an entire large
+  channel means hundreds of requests; do that rarely, and expect HTTP 429 if you do it often.
+- **Not affiliated with YouTube or Google.**
 
 ## 📜 License
 MIT License. Created for educational and research purposes.

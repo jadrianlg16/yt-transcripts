@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -21,6 +22,18 @@ def sample_entry(video_id="stage500001", title="Stage 5 Source"):
             {"text": "stage five reliability transcript", "start": 0, "duration": 5},
         ],
     }
+
+
+def deep_listing(count, published="2 days ago"):
+    return [
+        {
+            "videoId": f"deepvideo{index:03d}",
+            "title": f"Deep {index}",
+            "url": f"https://www.youtube.com/watch?v=deepvideo{index:03d}",
+            "published_text": published,
+        }
+        for index in range(count)
+    ]
 
 
 def reset_task_status():
@@ -121,9 +134,15 @@ class Stage5ApiTests(unittest.TestCase):
         main.backend_events.clear()
         main.backend_event_id = 0
         reset_task_status()
+        # Resolved at import time, so chdir alone does not isolate them when
+        # YT_TRANSCRIPTS_DATA_DIR points at a real data directory.
+        self.settings_paths = (main.SYSTEM_SETTINGS_PATH, main.MCP_SETTINGS_PATH)
+        main.SYSTEM_SETTINGS_PATH = Path(self.temp_dir.name) / "system_settings.json"
+        main.MCP_SETTINGS_PATH = Path(self.temp_dir.name) / "mcp_settings.json"
         self.client = TestClient(main.app)
 
     def tearDown(self):
+        main.SYSTEM_SETTINGS_PATH, main.MCP_SETTINGS_PATH = self.settings_paths
         os.chdir(self.cwd)
         self.temp_dir.cleanup()
 
@@ -136,6 +155,7 @@ class Stage5ApiTests(unittest.TestCase):
             return sample_entry(video_id, "Fetched success")
 
         with patch.object(main.scrapetube, "get_channel", return_value=videos), \
+             patch.object(main, "list_channel_videos", side_effect=RuntimeError("channel page unavailable")), \
              patch.object(main, "fetch_channel_rss_entries", side_effect=RuntimeError("RSS unavailable")), \
              patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
              patch.object(main.time, "sleep", return_value=None), \
@@ -183,7 +203,10 @@ class Stage5ApiTests(unittest.TestCase):
              patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
              patch.object(main.time, "sleep", return_value=None), \
              patch.object(main.random, "uniform", return_value=0):
-            response = self.client.post("/api/fetch/channel", json={"url": "https://youtube.com/@test"})
+            response = self.client.post(
+                "/api/fetch/channel",
+                json={"url": "https://youtube.com/@test", "limit": main.RSS_FEED_DEPTH},
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("run_id", response.json())
@@ -195,6 +218,143 @@ class Stage5ApiTests(unittest.TestCase):
         events = self.client.get("/api/events").json()["events"]
         found_events = [event for event in events if event["event"] == "channel_videos_found"]
         self.assertEqual(found_events[-1]["details"]["source"], "rss")
+
+    def test_deep_channel_fetch_pages_past_the_rss_cap(self):
+        def fake_listing(channel, limit=None, **kwargs):
+            videos = [
+                {
+                    "videoId": f"deepvideo{index:03d}",
+                    "title": f"Deep {index}",
+                    "url": f"https://www.youtube.com/watch?v=deepvideo{index:03d}",
+                    "published_text": "2 days ago",
+                }
+                for index in range(20)
+            ]
+            return videos if limit is None else videos[:limit]
+
+        def fake_fetch(video_id, languages=None):
+            return sample_entry(video_id, "Deep fetched")
+
+        with patch.object(main, "list_channel_videos", side_effect=fake_listing), \
+             patch.object(main, "fetch_channel_rss_entries", side_effect=AssertionError("RSS should not be used")), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=0):
+            response = self.client.post(
+                "/api/fetch/channel",
+                json={"url": "https://youtube.com/@test", "limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(main.store.all_entries()), 20)
+        found = [e for e in self.client.get("/api/events").json()["events"] if e["event"] == "channel_videos_found"]
+        self.assertEqual(found[-1]["details"]["listed"], 20)
+        self.assertEqual(found[-1]["details"]["source"], "channel_page")
+
+    def test_channel_fetch_skips_videos_already_in_the_archive(self):
+        main.store.add_entry(sample_entry("deepvideo000", "Already archived"))
+        fetched: list[str] = []
+
+        def fake_fetch(video_id, languages=None):
+            fetched.append(video_id)
+            return sample_entry(video_id, "Deep fetched")
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(3)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=0):
+            response = self.client.post(
+                "/api/fetch/channel",
+                json={"url": "https://youtube.com/@test", "limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("deepvideo000", fetched)
+        self.assertEqual(sorted(fetched), ["deepvideo001", "deepvideo002"])
+        found = [e for e in self.client.get("/api/events").json()["events"] if e["event"] == "channel_videos_found"]
+        self.assertEqual(found[-1]["details"]["already_saved"], 1)
+        self.assertEqual(found[-1]["details"]["total"], 2)
+
+    def test_rate_limited_channel_fetch_stops_early_and_leaves_the_rest_unfetched(self):
+        attempted: list[str] = []
+
+        def fake_fetch(video_id, languages=None):
+            attempted.append(video_id)
+            raise RuntimeError("YouTube is blocking requests from your IP")
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(20)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=0):
+            response = self.client.post(
+                "/api/fetch/channel",
+                json={"url": "https://youtube.com/@test", "limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # One attempt per backoff step, plus the attempt that exhausts them.
+        self.assertEqual(len(attempted), len(main.RATE_LIMIT_BACKOFF_SECONDS) + 1)
+        self.assertEqual(main.task_status["success_count"], 0)
+        self.assertIn("Stopped early", main.task_status["message"])
+        self.assertIn("left for a later run", main.task_status["message"])
+
+    def test_rate_limit_streak_resets_after_a_successful_fetch(self):
+        def fake_fetch(video_id, languages=None):
+            if video_id in {"deepvideo001", "deepvideo003"}:
+                raise RuntimeError("YouTube is blocking requests from your IP")
+            return sample_entry(video_id, "Saved anyway")
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(6)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=0):
+            response = self.client.post(
+                "/api/fetch/channel",
+                json={"url": "https://youtube.com/@test", "limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # Isolated rate limits must not end the run: 4 of 6 still land.
+        self.assertEqual(main.task_status["success_count"], 4)
+        self.assertNotIn("Stopped early", main.task_status["message"])
+
+    def test_non_rate_limit_failures_never_trigger_a_backoff(self):
+        def fake_fetch(video_id, languages=None):
+            raise RuntimeError("Subtitles are disabled for this video")
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(6)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=0):
+            response = self.client.post(
+                "/api/fetch/channel",
+                json={"url": "https://youtube.com/@test", "limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(main.task_status["failure_count"], 6)
+        self.assertNotIn("Stopped early", main.task_status["message"])
+
+    def test_channel_preview_marks_already_saved_titles(self):
+        main.store.add_entry(sample_entry("deepvideo000", "Already archived"))
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(3)):
+            response = self.client.post(
+                "/api/fetch/channel/preview",
+                json={"url": "https://youtube.com/@test", "limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual(payload["new_count"], 2)
+        self.assertEqual(payload["already_saved_count"], 1)
+        first = payload["candidates"][0]
+        self.assertEqual(first["video_id"], "deepvideo000")
+        self.assertTrue(first["already_saved"])
+        self.assertFalse(first["selected"])
+        self.assertEqual(first["title"], "Deep 0")
+        self.assertEqual(first["published_text"], "2 days ago")
 
     def test_watcher_settings_api_and_rss_parser_are_connected(self):
         default_response = self.client.get("/api/watcher/settings")

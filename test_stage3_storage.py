@@ -5,7 +5,7 @@ import unittest
 
 from core.research import search_entries
 from core.sqlite_store import SQLiteTranscriptStore, export_entries_to_json, migrate_json_to_sqlite
-from core.store import JsonTranscriptStore, create_transcript_store
+from core.store import JsonTranscriptStore, create_transcript_store, normalize_display_text
 
 
 def sample_entry(video_id, title, transcript, saved_at="2026-05-08 12:00"):
@@ -169,6 +169,63 @@ class Stage3MigrationAndExportTests(unittest.TestCase):
                 sqlite_path=db_path,
             )
             self.assertIsInstance(sqlite_store, SQLiteTranscriptStore)
+
+
+class ChannelNameNormalizationTests(unittest.TestCase):
+    def test_decodes_escaped_text_from_youtube_json(self):
+        self.assertEqual(
+            normalize_display_text("AI News \\u0026 Strategy Daily | Nate B Jones"),
+            "AI News & Strategy Daily | Nate B Jones",
+        )
+        self.assertEqual(normalize_display_text("Tips &amp; Tricks"), "Tips & Tricks")
+        self.assertEqual(normalize_display_text("  Plain Name  "), "Plain Name")
+
+    def test_new_entries_are_stored_with_a_decoded_channel_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteTranscriptStore(os.path.join(temp_dir, "transcripts.db"))
+            entry = sample_entry("alpha000001", "Escaped", "channel name decoding")
+            entry["channel"] = "AI News \\u0026 Strategy Daily"
+            store.add_entry(entry)
+
+            self.assertEqual(store.all_entries()[0]["channel"], "AI News & Strategy Daily")
+
+    def test_normalize_merges_the_duplicate_channel_an_old_archive_created(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "transcripts.db")
+            store = SQLiteTranscriptStore(db_path)
+            store.add_entry(sample_entry("alpha000001", "Old", "first archived video"))
+            store.add_entry(sample_entry("beta0000002", "New", "second archived video"))
+
+            # Recreate the split an older build left behind: same channel, two rows.
+            import sqlite3
+
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "UPDATE channels SET name = ? WHERE name = ?",
+                    ("AI News \\u0026 Strategy Daily", "Stage 3"),
+                )
+                connection.execute("INSERT INTO channels (name) VALUES (?)", ("AI News & Strategy Daily",))
+                new_id = connection.execute(
+                    "SELECT id FROM channels WHERE name = ?", ("AI News & Strategy Daily",)
+                ).fetchone()[0]
+                connection.execute(
+                    "UPDATE videos SET channel_id = ? WHERE video_id = ?", (new_id, "beta0000002")
+                )
+
+            store = SQLiteTranscriptStore(db_path)
+            result = store.normalize_channel_names()
+
+            self.assertEqual(result["merged"], 1)
+            channels = {entry["channel"] for entry in store.all_entries()}
+            self.assertEqual(channels, {"AI News & Strategy Daily"})
+            self.assertEqual(len(store.all_entries()), 2)
+
+    def test_normalize_is_a_no_op_on_a_clean_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteTranscriptStore(os.path.join(temp_dir, "transcripts.db"))
+            store.add_entry(sample_entry("alpha000001", "Clean", "nothing to normalize"))
+
+            self.assertEqual(store.normalize_channel_names(), {"renamed": 0, "merged": 0})
 
 
 if __name__ == "__main__":

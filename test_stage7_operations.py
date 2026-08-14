@@ -66,10 +66,17 @@ class Stage7OperationsApiTests(unittest.TestCase):
         main.backend_events.clear()
         main.backend_event_id = 0
         reset_task_status()
+        # These are resolved at import time, so when YT_TRANSCRIPTS_DATA_DIR points at a
+        # real data directory (as it does in the Docker image) chdir alone does not
+        # isolate them and the suite would rewrite live settings.
+        self.settings_paths = (main.SYSTEM_SETTINGS_PATH, main.MCP_SETTINGS_PATH)
+        main.SYSTEM_SETTINGS_PATH = Path(self.temp_dir.name) / "system_settings.json"
+        main.MCP_SETTINGS_PATH = Path(self.temp_dir.name) / "mcp_settings.json"
         mcp_server.PROJECT_ROOT = Path(self.temp_dir.name)
         self.client = TestClient(main.app)
 
     def tearDown(self):
+        main.SYSTEM_SETTINGS_PATH, main.MCP_SETTINGS_PATH = self.settings_paths
         os.chdir(self.cwd)
         self.temp_dir.cleanup()
 

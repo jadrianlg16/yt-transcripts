@@ -8,7 +8,7 @@ from typing import Any, Iterable, Iterator
 
 from core.research import search_entries as rank_search_entries
 from core.research import words
-from core.store import normalize_entry_display_fields
+from core.store import normalize_display_text, normalize_entry_display_fields
 
 DEFAULT_DB_FILE = "transcripts_store.sqlite3"
 UNKNOWN_CHANNEL = "Unknown Channel"
@@ -162,6 +162,11 @@ class SQLiteTranscriptStore:
             connection.execute("DELETE FROM videos WHERE video_id = ?", (video_id,))
             self._delete_fts_entry(connection, video_id)
 
+    def saved_video_ids(self) -> set[str]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT video_id FROM videos").fetchall()
+            return {str(row["video_id"]) for row in rows if row["video_id"]}
+
     def all_entries(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             video_rows = connection.execute(
@@ -303,6 +308,58 @@ class SQLiteTranscriptStore:
             })
             for row in rows
         ]
+
+    def normalize_channel_names(self) -> dict[str, Any]:
+        """Decode escaped channel names and fold the duplicates they created together.
+
+        Archives written before display normalisation stored names verbatim, so a
+        channel with an ``&`` in it exists twice: once escaped, once not.
+        """
+        renamed = 0
+        merged = 0
+        with self._connection() as connection:
+            rows = connection.execute("SELECT id, name FROM channels").fetchall()
+
+            groups: dict[str, list[sqlite3.Row]] = {}
+            for row in sorted(rows, key=lambda item: int(item["id"])):
+                clean = normalize_display_text(row["name"]) or UNKNOWN_CHANNEL
+                groups.setdefault(clean, []).append(row)
+
+            for clean, group in groups.items():
+                # Fold duplicates away before renaming, or the rename collides with
+                # the very row it is about to replace.
+                canonical, *duplicates = group
+                for duplicate in duplicates:
+                    connection.execute(
+                        "UPDATE videos SET channel_id = ? WHERE channel_id = ?",
+                        (canonical["id"], duplicate["id"]),
+                    )
+                    connection.execute("DELETE FROM channels WHERE id = ?", (duplicate["id"],))
+                    merged += 1
+
+                if canonical["name"] != clean:
+                    connection.execute(
+                        "UPDATE channels SET name = ? WHERE id = ?", (clean, canonical["id"])
+                    )
+                    renamed += 1
+
+            if self.fts_enabled and (renamed or merged):
+                connection.execute("DELETE FROM video_search_fts")
+                for row in connection.execute(
+                    """
+                    SELECT videos.video_id, videos.title, channels.name AS channel, videos.transcript
+                    FROM videos JOIN channels ON channels.id = videos.channel_id
+                    """
+                ).fetchall():
+                    connection.execute(
+                        """
+                        INSERT INTO video_search_fts (video_id, title, channel, transcript)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (row["video_id"], row["title"], row["channel"], row["transcript"]),
+                    )
+
+        return {"renamed": renamed, "merged": merged}
 
     def _upsert_channel(self, connection: sqlite3.Connection, name: str) -> int:
         connection.execute(
