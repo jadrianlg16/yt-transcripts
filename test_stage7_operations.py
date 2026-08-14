@@ -55,6 +55,7 @@ class Stage7OperationsApiTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.cwd = os.getcwd()
+        self.previous_project_root = mcp_server.PROJECT_ROOT
         os.chdir(self.temp_dir.name)
 
         main.store = TranscriptStore(os.path.join(self.temp_dir.name, "transcripts.json"))
@@ -72,11 +73,20 @@ class Stage7OperationsApiTests(unittest.TestCase):
         self.settings_paths = (main.SYSTEM_SETTINGS_PATH, main.MCP_SETTINGS_PATH)
         main.SYSTEM_SETTINGS_PATH = Path(self.temp_dir.name) / "system_settings.json"
         main.MCP_SETTINGS_PATH = Path(self.temp_dir.name) / "mcp_settings.json"
+        # mcp_server resolves its own paths from the environment on every call, so it
+        # reads the live data directory unless this points somewhere disposable.
+        self.previous_data_dir = os.environ.get("YT_TRANSCRIPTS_DATA_DIR")
+        os.environ["YT_TRANSCRIPTS_DATA_DIR"] = self.temp_dir.name
         mcp_server.PROJECT_ROOT = Path(self.temp_dir.name)
         self.client = TestClient(main.app)
 
     def tearDown(self):
         main.SYSTEM_SETTINGS_PATH, main.MCP_SETTINGS_PATH = self.settings_paths
+        if self.previous_data_dir is None:
+            os.environ.pop("YT_TRANSCRIPTS_DATA_DIR", None)
+        else:
+            os.environ["YT_TRANSCRIPTS_DATA_DIR"] = self.previous_data_dir
+        mcp_server.PROJECT_ROOT = self.previous_project_root
         os.chdir(self.cwd)
         self.temp_dir.cleanup()
 

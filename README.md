@@ -43,7 +43,34 @@ connect a local MCP-compatible client using the included `.mcp.json` file.
 The compatibility tools follow the frontier-model retrieval contract:
 
 - `search(query)` returns document IDs, video titles, and canonical YouTube URLs.
-- `fetch(id)` returns the complete transcript plus source metadata.
+- `fetch(id)` returns the transcript plus source metadata, bounded so one very long
+  video cannot swallow a caller's context window. Truncation is reported in the
+  metadata, and `YT_TRANSCRIPTS_MCP_FETCH_CHARS` moves the cap.
+
+#### Passages, not documents
+
+`search_passages(query)` is the tool to reach for when the question is "where was this
+said?" rather than "give me this video". It returns the best-matching windows of speech
+with their timecodes and links that open the video at that moment:
+
+```json
+{
+  "text": "companies don't store their most important knowledge in the kind of text or prose that rag is designed to solve for...",
+  "start_timecode": "10:23",
+  "url": "https://www.youtube.com/watch?v=lqiwQiDglGk&t=623s",
+  "content_type": "verbatim_transcript"
+}
+```
+
+Why it exists: a whole transcript averages several thousand tokens, so answering one
+research question by fetching the handful of relevant videos costs tens of thousands of
+tokens, most of them irrelevant to the question. The same question answered from passages
+costs about a thousand, and every claim arrives with a citation.
+
+Results are spread across videos rather than stacking on the single best match
+(`max_per_video`), and each response reports its own `estimated_tokens`. `content_type`
+marks passages as verbatim transcript so a caller can always tell recorded speech from
+anything a model inferred.
 
 Search works immediately with lexical ranking. If local AI is enabled and a
 semantic index has been built from the AI settings screen, it automatically

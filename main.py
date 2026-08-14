@@ -87,9 +87,12 @@ watcher_thread: threading.Thread | None = None
 task_status_lock = threading.Lock()
 task_cancel_event = threading.Event()
 
+# Kept in step with the @mcp.tool functions in mcp_server.py; test_stage7_operations
+# asserts the two lists match so a new tool cannot go missing from the UI.
 MCP_TOOL_NAMES = [
     "search",
     "fetch",
+    "search_passages",
     "list_transcripts",
     "search_transcripts",
     "get_transcript",

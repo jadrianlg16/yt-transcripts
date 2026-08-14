@@ -339,7 +339,7 @@ choose primitives that deliver it. Never database-first.
 Measured against that, this project is a chatbot-era retrieval system serving agent-era
 requests.
 
-### 9.1 Cap what `fetch` returns, and return passages instead of documents
+### 9.1 Cap what `fetch` returns, and return passages instead of documents — DONE 2026-08-14
 
 The MCP `fetch` tool returns `entry["transcript"]` uncapped, while every neighbouring
 tool routes through `_cap_text`. At the current archive that is ~5,600 tokens for an
@@ -357,6 +357,25 @@ Two changes, in order of value:
 
 Keep whole-document `fetch` available — it is the correct unit when the agent has already
 decided a specific video is the subject. It is the wrong *default*.
+
+**Shipped.** `fetch` is now bounded (`YT_TRANSCRIPTS_MCP_FETCH_CHARS`, default 50k chars)
+and reports truncation. `search_passages` returns scored windows of consecutive caption
+segments with timecodes and `&t=` deep links, spread across videos by a per-video cap.
+
+Two things surfaced during implementation that were not visible from the outside:
+
+- **Caption segments are useless as passages on their own.** They average 37 characters
+  and about four seconds, and break mid-sentence. A passage has to be a run of consecutive
+  segments rejoined; the default window is 16 (~60s, ~600 chars).
+- **The existing matcher is all-terms-or-nothing.** `core.research._text_matches` requires
+  every query term in the same text, and the FTS candidate query ANDs its terms. At
+  document level that mostly works; at segment level it returns nothing, so a query like
+  "agent memory rag vector search" produced zero passages. `search_passages` scores by
+  term coverage and uses an OR-ranked bm25 candidate pool instead. The document-level
+  search was left alone — changing it would move results the UI depends on.
+
+Measured on the live endpoint: six passages across four videos for 915 tokens, against
+5,647 tokens for a single full `fetch` of just the top video.
 
 ### 9.2 Name the retrieval unit for each question type
 

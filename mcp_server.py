@@ -39,7 +39,16 @@ DEFAULT_SEGMENT_CHARS = 500
 MAX_SEGMENT_CHARS = 2000
 DEFAULT_STANDARD_SEARCH_LIMIT = 10
 MAX_STANDARD_SEARCH_LIMIT = 25
+DEFAULT_PASSAGE_LIMIT = 12
+MAX_PASSAGE_LIMIT = 50
+DEFAULT_PASSAGES_PER_VIDEO = 3
+# Caption segments are ~4s of speech and break mid-sentence, so a readable passage
+# is a run of them. 16 lands around 60 seconds and 600 characters.
+DEFAULT_PASSAGE_WINDOW = 16
+MAX_PASSAGE_WINDOW = 60
 RRF_RANK_CONSTANT = 60
+# Rough enough to let a caller see what a response costs before spending it.
+CHARS_PER_TOKEN_ESTIMATE = 4
 
 
 class SearchResult(BaseModel):
@@ -325,6 +334,115 @@ def _canonical_video_url(entry: dict[str, Any]) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def _timecode(seconds: Any) -> str:
+    """Seconds to h:mm:ss / m:ss, so a passage reads like a citation."""
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _passage_url(entry: dict[str, Any], start: Any) -> str:
+    """Deep link that opens the video at the moment the passage was spoken."""
+    base = _canonical_video_url(entry)
+    try:
+        offset = max(0, int(float(start or 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}t={offset}s"
+
+
+def _window_score(text: str, terms: list[str], phrase: str) -> float:
+    """Rank a window by coverage first, then density.
+
+    Deliberately not the all-terms-or-nothing rule the document matcher uses: a
+    caption window is only a few seconds of speech, so demanding every query term
+    inside one window returns nothing for any realistic multi-word question.
+    """
+    normalized = (text or "").lower()
+    if not normalized:
+        return 0.0
+
+    matched_terms = [term for term in terms if term in normalized]
+    if not matched_terms and phrase not in normalized:
+        return 0.0
+
+    coverage = len(matched_terms) / len(terms) if terms else 0.0
+    density = sum(normalized.count(term) for term in matched_terms)
+    return coverage * 10 + density + (5 if phrase and phrase in normalized else 0)
+
+
+def _passage_windows(
+    entry: dict[str, Any],
+    terms: list[str],
+    phrase: str,
+    max_per_video: int,
+    text_limit: int,
+    window_segments: int,
+) -> list[dict[str, Any]]:
+    """Best-scoring, non-overlapping caption windows for one video.
+
+    Individual caption segments run about four seconds and break mid-sentence, so a
+    passage is a run of consecutive segments joined back into readable speech.
+    """
+    segments = [s for s in (entry.get("segments") or []) if isinstance(s, dict)]
+    if not segments:
+        return []
+
+    summary = _entry_summary(entry)
+    stride = max(1, window_segments // 2)
+    scored: list[tuple[float, int, str]] = []
+    for start_index in range(0, len(segments), stride):
+        window = segments[start_index : start_index + window_segments]
+        if not window:
+            break
+        text = " ".join(str(s.get("text") or "").strip() for s in window).strip()
+        score = _window_score(text, terms, phrase)
+        if score > 0:
+            scored.append((score, start_index, text))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+
+    passages: list[dict[str, Any]] = []
+    claimed: set[int] = set()
+    for score, start_index, text in scored:
+        span = set(range(start_index, start_index + window_segments))
+        if span & claimed:
+            continue
+        claimed |= span
+
+        capped = _cap_text(text, text_limit)
+        start = segments[start_index].get("start", 0)
+        passages.append(
+            {
+                "video_id": summary["video_id"],
+                "title": summary["title"],
+                "channel": summary["channel"],
+                "uploaded_at": summary["uploaded_at"],
+                # Verbatim transcript, never a model summary. Callers should be able
+                # to tell ground truth from inference without asking.
+                "content_type": "verbatim_transcript",
+                "text": capped["text"],
+                "text_char_count": capped["char_count"],
+                "text_truncated": capped["truncated"],
+                "start": float(start or 0),
+                "start_timecode": _timecode(start),
+                "url": _passage_url(entry, start),
+                "passage_score": round(score, 3),
+            }
+        )
+        if len(passages) >= max_per_video:
+            break
+
+    return passages
+
+
 def _sqlite_fts_candidate_ids(query: str, limit: int) -> tuple[list[str], bool]:
     path = _data_path(SQLITE_DATA_FILE)
     if not path.exists():
@@ -335,6 +453,44 @@ def _sqlite_fts_candidate_ids(query: str, limit: int) -> tuple[list[str], bool]:
         return [], True
 
     fts_query = " ".join(f"{term}*" for term in terms)
+    try:
+        connection = sqlite3.connect(_sqlite_uri(path), uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT video_id
+                FROM video_search_fts
+                WHERE video_search_fts MATCH ?
+                ORDER BY bm25(video_search_fts)
+                LIMIT ?
+                """,
+                (fts_query, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return [], False
+
+    return [str(row["video_id"]) for row in rows], True
+
+
+def _passage_candidate_ids(query: str, limit: int) -> tuple[list[str], bool]:
+    """Videos worth scanning for passages, ranked by bm25.
+
+    Uses OR rather than the implicit AND of the document search. A question like
+    "agent memory rag vector search" has no single video containing every term, so
+    an AND candidate query hands the passage scorer almost nothing to work with.
+    """
+    path = _data_path(SQLITE_DATA_FILE)
+    if not path.exists():
+        return [], False
+
+    terms = [term for term in words(query) if len(term) > 1]
+    if not terms:
+        return [], False
+
+    fts_query = " OR ".join(f"{term}*" for term in terms)
     try:
         connection = sqlite3.connect(_sqlite_uri(path), uri=True)
         connection.row_factory = sqlite3.Row
@@ -627,7 +783,13 @@ def search(query: str) -> SearchOutput:
 
 @mcp.tool(structured_output=True)
 def fetch(id: str) -> FetchOutput:
-    """Fetch the complete transcript and metadata for an id returned by search."""
+    """Fetch the full transcript and metadata for an id returned by search.
+
+    Returns a whole document, which is the right unit only once you already know
+    this video is the subject. To find where something was said across the archive,
+    use search_passages instead; it answers the same question for a fraction of the
+    tokens.
+    """
     _require_mcp_enabled()
     entries, storage = _load_transcripts()
     video_id = str(id or "").strip()
@@ -636,13 +798,26 @@ def fetch(id: str) -> FetchOutput:
         raise ValueError(f"Transcript not found: {video_id}")
 
     summary = _entry_summary(entry)
+    # Bounded so one unusually long transcript cannot blow up a caller's context
+    # window. The default clears every transcript in a normal archive; it is a
+    # guardrail, not a summarisation step.
+    capped = _cap_text(
+        entry.get("transcript") or "",
+        _bounded_int(
+            os.getenv("YT_TRANSCRIPTS_MCP_FETCH_CHARS"),
+            MAX_TRANSCRIPT_CHARS,
+            1000,
+            MAX_MARKDOWN_CHARS,
+        ),
+    )
     return FetchOutput(
         id=video_id,
         title=str(summary["title"]),
-        text=str(entry.get("transcript") or ""),
+        text=capped["text"],
         url=_canonical_video_url(entry),
         metadata={
             "source": "youtube_transcript",
+            "content_type": "verbatim_transcript",
             "video_id": video_id,
             "channel": summary["channel"],
             "saved_at": summary["saved_at"],
@@ -652,6 +827,10 @@ def fetch(id: str) -> FetchOutput:
             "segment_count": summary["segment_count"],
             "duration_seconds": summary["duration_seconds"],
             "storage_backend": storage["backend"],
+            "text_char_count": capped["char_count"],
+            "text_truncated": capped["truncated"],
+            "max_chars": capped["max_chars"],
+            "estimated_tokens": len(capped["text"]) // CHARS_PER_TOKEN_ESTIMATE,
         },
     )
 
@@ -742,6 +921,111 @@ def search_transcripts(
         "results": _cap_match_text(results, max_match_chars),
         "count": len(results),
         "retrieval": retrieval,
+        "storage": storage,
+    }
+
+
+@mcp.tool()
+def search_passages(
+    query: str,
+    channel: str | None = None,
+    limit: int = DEFAULT_PASSAGE_LIMIT,
+    max_per_video: int = DEFAULT_PASSAGES_PER_VIDEO,
+    max_text_chars: int = DEFAULT_MATCH_CHARS,
+    window_segments: int = DEFAULT_PASSAGE_WINDOW,
+) -> dict[str, Any]:
+    """Find where something was said, returning quotable passages instead of documents.
+
+    Each passage carries its video, timecode, and a link that opens the video at that
+    moment, so an answer can cite the source without ever loading a full transcript.
+    Results are spread across videos rather than stacking on the best-matching one.
+
+    Prefer this over fetch for questions about the archive. Reach for fetch only when a
+    single video is already established as the subject and the whole text is genuinely
+    needed.
+    """
+    if not _mcp_enabled():
+        return _mcp_disabled_response()
+
+    entries, storage = _load_transcripts()
+    bounded_limit = _bounded_int(limit, DEFAULT_PASSAGE_LIMIT, 1, MAX_PASSAGE_LIMIT)
+    per_video = _bounded_int(max_per_video, DEFAULT_PASSAGES_PER_VIDEO, 1, 10)
+    text_limit = _bounded_int(max_text_chars, DEFAULT_MATCH_CHARS, 0, MAX_MATCH_CHARS)
+    window = _bounded_int(window_segments, DEFAULT_PASSAGE_WINDOW, 2, MAX_PASSAGE_WINDOW)
+
+    phrase = " ".join((query or "").lower().split())
+    terms = [term for term in words(phrase) if len(term) > 1]
+    if not terms:
+        return {
+            "query": query,
+            "passages": [],
+            "count": 0,
+            "videos_represented": 0,
+            "estimated_tokens": 0,
+            "retrieval": {"method": "none", "reason": "Query has no searchable terms."},
+            "storage": storage,
+        }
+
+    channel_filter = (channel or "").strip().lower()
+    eligible = [
+        entry
+        for entry in entries
+        if not channel_filter
+        or str(entry.get("channel") or "Unknown Channel").lower() == channel_filter
+    ]
+    entry_lookup = _transcript_lookup(eligible)
+
+    candidate_ids, fts_used = _passage_candidate_ids(query, MAX_LIST_LIMIT)
+    candidates = [entry_lookup[i] for i in candidate_ids if i in entry_lookup] if fts_used else []
+    semantic_results, semantic = _semantic_video_results(query, set(entry_lookup), MAX_LIST_LIMIT)
+    for result in semantic_results:
+        entry = entry_lookup.get(str(result.get("video_id") or ""))
+        if entry is not None and entry not in candidates:
+            candidates.append(entry)
+    if not candidates:
+        candidates = eligible
+
+    # Score every candidate, then rank passages against each other rather than
+    # letting one strong video fill the whole budget.
+    scored: list[dict[str, Any]] = []
+    for entry in candidates:
+        scored.extend(
+            _passage_windows(
+                entry,
+                terms,
+                phrase,
+                max_per_video=per_video,
+                text_limit=text_limit,
+                window_segments=window,
+            )
+        )
+    scored.sort(key=lambda passage: -float(passage.get("passage_score") or 0))
+
+    passages: list[dict[str, Any]] = []
+    per_video_counts: dict[str, int] = {}
+    for passage in scored:
+        video_id = str(passage.get("video_id") or "")
+        if per_video_counts.get(video_id, 0) >= per_video:
+            continue
+        per_video_counts[video_id] = per_video_counts.get(video_id, 0) + 1
+        passages.append(passage)
+        if len(passages) >= bounded_limit:
+            break
+
+    returned_chars = sum(len(passage["text"]) for passage in passages)
+    return {
+        "query": query,
+        "passages": passages,
+        "count": len(passages),
+        "videos_represented": len(per_video_counts),
+        "estimated_tokens": returned_chars // CHARS_PER_TOKEN_ESTIMATE,
+        "retrieval": {
+            "method": "passage_windows",
+            "candidate_source": "sqlite_fts_or" if fts_used else "full_scan",
+            "candidates_scanned": len(candidates),
+            "window_segments": window,
+            "semantic": semantic,
+        },
         "storage": storage,
     }
 
