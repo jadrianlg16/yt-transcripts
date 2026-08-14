@@ -288,11 +288,54 @@ Completed:
 
 ## Immediate Next Implementation Options
 
-Recommended next task: Stage 8 UI regression tests and operational hardening.
+Recommended next task: **Stage 8, ingest throughput under rate limiting.**
 
-Why: Stage 7 is now implemented. The next product gain is preventing regressions in the larger frontend settings surface and making long-running operations more predictable.
+Why: this is now the binding constraint, and it is measured, not guessed. A 40-video
+run on 2026-08-14 saved 23 and then hit `RequestBlocked` on every remaining video.
+The block persisted for over 20 minutes and starved a second channel run completely.
+Depth, dedupe, and backoff are solved; how many transcripts per hour the archive can
+actually absorb is not.
 
-Alternative smaller task: add an optional supervisor process if true backend restart/shutdown from the browser is still desired.
+Concretely, in priority order:
+
+1. **Persist a rate-limit cooldown.** Backoff is per-run, so a fresh run walks
+   straight back into an active block and burns its first videos. Record the last
+   block time and refuse or delay new runs until it has aged out.
+2. **Drain a queue instead of running bursts.** The watcher already runs on a timer.
+   Turning "fetch 40 now" into "fetch a few every N minutes until the backlog is
+   empty" fits the tool's real usage and stays under the limit. This subsumes the
+   current retry-failed flow.
+3. **Retry the leftovers automatically.** A run that stops early leaves a known set
+   of unfetched ids; today re-fetching them is a manual second run.
+
+Then, in rough value order:
+
+4. **UI regression tests** (the original Stage 8 item). The settings surface and the
+   new channel preview panel are both untested in a browser.
+5. **Drop `scrapetube`.** It returns zero videos for every lookup shape since YouTube
+   moved channel grids to `lockupViewModel`; `core/channel_listing.py` replaced it and
+   it now only pads the fallback chain. Removing it drops a dependency.
+6. **Verify the AI layer end to end.** Semantic search, summaries, and the MCP tools
+   all need Ollama running and a built index. None of it has been exercised against a
+   live model recently, and it is the part the project is presented on.
+7. **Retire `app.py`.** The legacy Tkinter app duplicates fetch logic that has now
+   diverged from `main.py` (no dedupe, no deep listing, no backoff).
+
+## Session Log: 2026-08-14
+
+- Bulk channel fetch was capped at 15 videos because RSS returns only the 15 newest
+  uploads, and the `scrapetube` fallback silently returned nothing. Replaced with
+  `core/channel_listing.py`, which reads the channel page grid and follows
+  continuations. Verified at depth: 150 listed for one channel.
+- Channel fetch had no dedupe at all. It now filters against stored video ids before
+  requesting anything, and `POST /api/fetch/channel/preview` lists recent titles
+  flagged new vs archived so a run can be scoped first.
+- Added rate-limit detection with 30s/90s/180s backoff and an early stop.
+- Merged the duplicate channel that older archives created by storing `&`
+  verbatim in channel names. 45 + 30 rows folded into one.
+- Fixed test isolation: settings and index paths were resolved at import time, so
+  with `YT_TRANSCRIPTS_DATA_DIR` set the suite rewrote the live data directory and
+  left ingestion paused. Suite went from 68 tests with 5 failures to 89 passing.
 
 ## Working Commands
 
