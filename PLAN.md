@@ -308,6 +308,14 @@ Concretely, in priority order:
    Backoff bases were also moved off round numbers and every wait is now jittered ±40%
    (`_jittered`). Retrying at exactly 30/90/180 seconds each time is a machine signature,
    which is the opposite of what backing off is for.
+
+   **The durations are guesses and the first one looks short.** The block observed on
+   2026-08-14 was still rejecting requests hours after the burst that caused it, across
+   several separate attempts. The bases were left as they are because escalation is the
+   mechanism for guessing low, and a punishing first wait would be wrong for a mild
+   block. The real fix is to stop guessing: record the interval between a block starting
+   and the next successful fetch, and calibrate from the observed distribution. That
+   belongs with 9.5, which is the same argument applied to retrieval.
 2. **Drain a queue instead of running bursts.** The watcher already runs on a timer.
    Turning "fetch 40 now" into "fetch a few every N minutes until the backlog is
    empty" fits the tool's real usage and stays under the limit. This subsumes the
