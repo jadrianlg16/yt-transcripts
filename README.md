@@ -142,6 +142,10 @@ If you prefer to run them separately:
   any transcript request is made, so re-running a channel only costs one listing request.
 - **Request Pacing:** Randomised delays between videos and a fixed delay between listing pages
   keep a bulk run from hammering YouTube.
+- **Backoff And Cooldown:** When YouTube starts blocking transcript requests the run waits,
+  then gives up and leaves the rest unfetched rather than burning the list collecting
+  failures. Ingestion is then parked until the block has plausibly aged out, so the next
+  run does not walk straight back into it. Every wait is jittered.
 
 The listing tiers itself by depth: `limit` ≤ 15 uses the channel RSS feed (one cheap request),
 anything deeper reads the channel page. If one source fails the other is tried, so a YouTube
@@ -202,6 +206,19 @@ We are moving from a "Scraping Tool" to a **Personal Knowledge Engine**. Here ar
 - **Clickable Timestamps:** Clicking a sentence in the transcript will open the YouTube video at the exact second the words were spoken.
 
 ---
+
+### When ingestion is paused
+
+After a run gives up, `GET /api/fetch/cooldown` reports how long is left and how many
+consecutive blocks have happened. Fetch endpoints answer `429` with the remaining wait
+while it is active, and the channel watcher skips its scheduled runs.
+
+The wait is a guess, not a measurement — YouTube does not say how long a block lasts. If it
+is longer than reality, clear it deliberately:
+
+```bash
+curl -X POST http://localhost:5014/api/fetch/cooldown/clear
+```
 
 ## ⚖️ Responsible Use
 

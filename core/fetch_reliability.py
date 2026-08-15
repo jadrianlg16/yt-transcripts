@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,6 +23,14 @@ DEFAULT_WATCHER_SETTINGS = {
     "languages": ["en"],
     "last_checked_at": None,
     "next_check_at": None,
+}
+
+DEFAULT_COOLDOWN = {
+    "until": None,
+    "reason": "",
+    "started_at": None,
+    # Consecutive blocks, so repeat offences can wait longer than the first.
+    "strikes": 0,
 }
 
 
@@ -251,26 +260,101 @@ class FetchReliabilityStore:
         self._save()
         return settings
 
+    def get_cooldown(self) -> dict[str, Any]:
+        """Current rate-limit cooldown, with the remaining seconds resolved now."""
+        cooldown = normalize_cooldown(self.data.get("cooldown", {}))
+        remaining = _seconds_until(cooldown["until"])
+        return {**cooldown, "active": remaining > 0, "remaining_seconds": remaining}
+
+    def start_cooldown(self, seconds: int, reason: str = "") -> dict[str, Any]:
+        """Hold off new ingestion until the block YouTube applied has aged out.
+
+        Consecutive blocks raise the strike count so a caller can back off harder
+        the second and third time rather than repeating the same wait.
+        """
+        current = self.get_cooldown()
+        bounded_seconds = max(0, int(seconds))
+        self.data["cooldown"] = {
+            "until": _iso_after(bounded_seconds),
+            "reason": str(reason or ""),
+            "started_at": utc_now(),
+            "strikes": int(current.get("strikes") or 0) + 1,
+        }
+        self._save()
+        return self.get_cooldown()
+
+    def clear_cooldown(self) -> dict[str, Any]:
+        self.data["cooldown"] = dict(DEFAULT_COOLDOWN)
+        self._save()
+        return self.get_cooldown()
+
+    def record_clean_run(self) -> dict[str, Any]:
+        """A run that finished without being blocked resets the strike count."""
+        cooldown = self.get_cooldown()
+        if not cooldown["active"] and cooldown["strikes"]:
+            return self.clear_cooldown()
+        return cooldown
+
     def _load(self) -> dict[str, Any]:
+        empty = {
+            "runs": [],
+            "watcher": dict(DEFAULT_WATCHER_SETTINGS),
+            "cooldown": dict(DEFAULT_COOLDOWN),
+        }
         if not self.file_path.exists():
-            return {"runs": [], "watcher": dict(DEFAULT_WATCHER_SETTINGS)}
+            return empty
 
         try:
             with self.file_path.open("r", encoding="utf-8") as file:
                 data = json.load(file)
         except (OSError, json.JSONDecodeError):
-            return {"runs": [], "watcher": dict(DEFAULT_WATCHER_SETTINGS)}
+            return empty
 
         runs = data.get("runs", []) if isinstance(data, dict) else []
         watcher = data.get("watcher", {}) if isinstance(data, dict) else {}
+        cooldown = data.get("cooldown", {}) if isinstance(data, dict) else {}
         return {
             "runs": [normalize_run(run) for run in runs if isinstance(run, dict)][-MAX_FETCH_RUNS:],
             "watcher": normalize_watcher_settings(watcher),
+            "cooldown": normalize_cooldown(cooldown),
         }
 
     def _save(self) -> None:
         with self.file_path.open("w", encoding="utf-8") as file:
             json.dump(self.data, file, indent=2, ensure_ascii=False)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _seconds_until(value: Any) -> int:
+    deadline = _parse_iso(value)
+    if deadline is None:
+        return 0
+    return max(0, int((deadline - datetime.now(timezone.utc)).total_seconds()))
+
+
+def _iso_after(seconds: int) -> str:
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=max(0, int(seconds)))
+    return deadline.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalize_cooldown(cooldown: Any) -> dict[str, Any]:
+    source = cooldown if isinstance(cooldown, dict) else {}
+    until = source.get("until")
+    return {
+        "until": str(until) if until else None,
+        "reason": str(source.get("reason") or ""),
+        "started_at": str(source.get("started_at")) if source.get("started_at") else None,
+        "strikes": max(0, int(source.get("strikes") or 0)),
+    }
 
 
 def normalize_run(run: dict[str, Any]) -> dict[str, Any]:

@@ -366,6 +366,18 @@ def _ensure_ingestion_allowed() -> None:
     if settings.get("ingestion_paused"):
         raise HTTPException(status_code=409, detail="Ingestion is paused")
 
+    cooldown = reliability_store.get_cooldown()
+    if cooldown["active"]:
+        # 429 rather than 409: this is YouTube's limit being respected, not a
+        # local switch. Clear it deliberately via /api/fetch/cooldown/clear.
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "YouTube rate limited the last run. Waiting "
+                f"{_format_cooldown_wait(cooldown['remaining_seconds'])} before fetching again."
+            ),
+        )
+
 
 def _task_cancel_requested() -> bool:
     return task_cancel_event.is_set()
@@ -824,8 +836,22 @@ def _fetch_and_save_video(
 # YouTube starts refusing transcript requests after a burst. Backing off and then
 # stopping the run beats burning through the rest of the list collecting failures:
 # whatever is left stays unfetched, so the next run picks it up as new.
-RATE_LIMIT_BACKOFF_SECONDS = (30, 90, 180)
+#
+# The bases are deliberately uneven and every wait is jittered. A retry landing on
+# exactly 30/90/180 seconds every time is a machine signature, and the point of
+# backing off is to look less like something worth blocking.
+RATE_LIMIT_BACKOFF_SECONDS = (43, 118, 227)
+# Once a run gives up, hold off new work entirely. Observed blocks have outlasted
+# an hour, so these are minutes rather than seconds, and escalate per strike.
+RATE_LIMIT_COOLDOWN_SECONDS = (1_307, 3_067, 5_881)  # ~22m, ~51m, ~98m
+RATE_LIMIT_JITTER = 0.4
 RATE_LIMIT_MARKERS = ("blocking requests", "too many requests", "429")
+
+
+def _jittered(seconds: float, jitter: float = RATE_LIMIT_JITTER) -> int:
+    """Spread a delay around its base so repeated waits never repeat exactly."""
+    spread = max(0.0, min(jitter, 0.9))
+    return max(1, int(seconds * random.uniform(1 - spread, 1 + spread)))
 
 
 def _is_rate_limited(error: Exception | str) -> bool:
@@ -842,7 +868,7 @@ def _rate_limit_pause(consecutive: int, run_id: str) -> bool:
     if consecutive > len(RATE_LIMIT_BACKOFF_SECONDS):
         return False
 
-    delay = RATE_LIMIT_BACKOFF_SECONDS[consecutive - 1]
+    delay = _jittered(RATE_LIMIT_BACKOFF_SECONDS[consecutive - 1])
     update_task_status(message=f"YouTube is rate limiting. Waiting {delay}s before retrying...")
     record_event("warning", "fetch_rate_limited", f"Rate limited; backing off {delay}s", {
         "run_id": run_id,
@@ -855,6 +881,36 @@ def _rate_limit_pause(consecutive: int, run_id: str) -> bool:
             return False
         time.sleep(1)
     return True
+
+
+def _begin_rate_limit_cooldown(run_id: str, reason: str) -> dict[str, Any]:
+    """Park ingestion after a run gives up, so the next one does not re-trip the block."""
+    strikes = reliability_store.get_cooldown().get("strikes") or 0
+    index = min(int(strikes), len(RATE_LIMIT_COOLDOWN_SECONDS) - 1)
+    cooldown = reliability_store.start_cooldown(
+        _jittered(RATE_LIMIT_COOLDOWN_SECONDS[index]),
+        reason=reason,
+    )
+    record_event(
+        "warning",
+        "ingestion_cooldown_started",
+        f"Ingestion paused for {cooldown['remaining_seconds']}s after repeated rate limiting",
+        {
+            "run_id": run_id,
+            "until": cooldown["until"],
+            "remaining_seconds": cooldown["remaining_seconds"],
+            "strikes": cooldown["strikes"],
+        },
+    )
+    return cooldown
+
+
+def _format_cooldown_wait(seconds: int) -> str:
+    minutes, remainder = divmod(max(0, int(seconds)), 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {remainder}s" if minutes else f"{remainder}s"
 
 
 def _record_fetch_failure(
@@ -1174,6 +1230,10 @@ def plan_channel_fetch(
 
 def watcher_due(settings: dict[str, Any]) -> bool:
     if not settings.get("enabled") or not settings.get("channels"):
+        return False
+
+    # Scheduled work must never be the thing that re-trips an active block.
+    if reliability_store.get_cooldown()["active"]:
         return False
 
     next_check = _parse_iso_utc(settings.get("next_check_at"))
@@ -1536,6 +1596,32 @@ def get_backend_events(after: int = 0, limit: int = 100):
 @app.get("/api/fetch/runs")
 def get_fetch_runs(limit: int = 25):
     return {"runs": reliability_store.list_runs(limit=limit)}
+
+
+@app.get("/api/fetch/cooldown")
+def get_fetch_cooldown():
+    cooldown = reliability_store.get_cooldown()
+    return {
+        **cooldown,
+        "wait_label": _format_cooldown_wait(cooldown["remaining_seconds"]),
+    }
+
+
+@app.post("/api/fetch/cooldown/clear")
+def clear_fetch_cooldown():
+    """Deliberate override for when the wait is longer than the real block."""
+    previous = reliability_store.get_cooldown()
+    cooldown = reliability_store.clear_cooldown()
+    if previous["active"]:
+        record_event("info", "ingestion_cooldown_cleared", "Rate-limit cooldown cleared manually", {
+            "skipped_seconds": previous["remaining_seconds"],
+            "strikes": previous["strikes"],
+        })
+    return {
+        "status": "success",
+        **cooldown,
+        "wait_label": _format_cooldown_wait(cooldown["remaining_seconds"]),
+    }
 
 
 @app.get("/api/fetch/runs/{run_id}")
@@ -2325,17 +2411,29 @@ def background_channel_fetch(
                     rate_limit_streak = 0
                 continue
 
-        message = (
-            "Bulk fetch finished. "
-            f"Saved {task_status['success_count']} of {total} new; "
-            f"failed {task_status['skipped_count']}; "
-            f"already archived {already_saved_count}."
-        )
+        if _task_cancel_requested():
+            # Cancelling out of a backoff is a human decision, not a block. Parking
+            # ingestion here would punish the user for stopping their own run.
+            _finish_canceled_task(run_id)
+            return
+
         if stopped_early:
+            cooldown = _begin_rate_limit_cooldown(
+                run_id, f"Channel fetch stopped early with {stopped_early} videos left"
+            )
             message = (
                 f"Stopped early: YouTube is rate limiting. "
                 f"Saved {task_status['success_count']}; "
                 f"{stopped_early} left for a later run; "
+                f"already archived {already_saved_count}. "
+                f"Ingestion paused for {_format_cooldown_wait(cooldown['remaining_seconds'])}."
+            )
+        else:
+            reliability_store.record_clean_run()
+            message = (
+                "Bulk fetch finished. "
+                f"Saved {task_status['success_count']} of {total} new; "
+                f"failed {task_status['skipped_count']}; "
                 f"already archived {already_saved_count}."
             )
         finish_task(message)
@@ -2490,7 +2588,9 @@ def background_watcher_refresh(scheduled: bool = False, run_id: str | None = Non
                     "error": str(exc),
                 })
 
-        existing_video_ids = set(transcript_lookup())
+        existing_video_ids = saved_video_ids()
+        rate_limit_streak = 0
+        watcher_stopped_early = 0
         total = len(candidates)
         reliability_store.set_total(run_id, total)
         update_task_status(total=total, progress=0, message=f"Watcher found {total} RSS videos")
@@ -2564,8 +2664,35 @@ def background_watcher_refresh(scheduled: bool = False, run_id: str | None = Non
                     "error": str(exc),
                 })
 
+                if _is_rate_limited(exc):
+                    rate_limit_streak += 1
+                    if not _rate_limit_pause(rate_limit_streak, run_id):
+                        watcher_stopped_early = total - index
+                        break
+                else:
+                    rate_limit_streak = 0
+
+        if _task_cancel_requested():
+            _finish_canceled_task(run_id)
+            return
+
         next_check_at = _next_watcher_check_at(settings["frequency_minutes"]) if settings.get("enabled") else None
         reliability_store.mark_watcher_checked(next_check_at=next_check_at)
+        if watcher_stopped_early:
+            cooldown = _begin_rate_limit_cooldown(
+                run_id, f"Watcher stopped early with {watcher_stopped_early} videos left"
+            )
+            message = (
+                "Watcher stopped early: YouTube is rate limiting. "
+                f"Saved {task_status['success_count']}; "
+                f"{watcher_stopped_early} left for a later run. "
+                f"Ingestion paused for {_format_cooldown_wait(cooldown['remaining_seconds'])}."
+            )
+            reliability_store.finish_run(run_id, message=message)
+            finish_task(message, level="warning")
+            return
+
+        reliability_store.record_clean_run()
         message = (
             "Watcher refresh finished. "
             f"Saved {task_status['success_count']} of {total}; "

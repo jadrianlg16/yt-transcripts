@@ -298,9 +298,16 @@ actually absorb is not.
 
 Concretely, in priority order:
 
-1. **Persist a rate-limit cooldown.** Backoff is per-run, so a fresh run walks
-   straight back into an active block and burns its first videos. Record the last
-   block time and refuse or delay new runs until it has aged out.
+1. ~~**Persist a rate-limit cooldown.**~~ **DONE 2026-08-14.** A run that gives up now
+   parks ingestion in `fetch_reliability.json` until the block has plausibly aged out.
+   Fetch endpoints answer `429` with the remaining wait, the watcher skips its scheduled
+   runs, and consecutive blocks escalate the wait (~22m, ~51m, ~98m) while a clean run
+   resets the strike count. `POST /api/fetch/cooldown/clear` overrides it deliberately,
+   because the duration is a guess — YouTube never says how long a block lasts.
+
+   Backoff bases were also moved off round numbers and every wait is now jittered ±40%
+   (`_jittered`). Retrying at exactly 30/90/180 seconds each time is a machine signature,
+   which is the opposite of what backing off is for.
 2. **Drain a queue instead of running bursts.** The watcher already runs on a timer.
    Turning "fetch 40 now" into "fetch a few every N minutes until the backlog is
    empty" fits the tool's real usage and stays under the limit. This subsumes the

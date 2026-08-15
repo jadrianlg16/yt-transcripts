@@ -335,6 +335,112 @@ class Stage5ApiTests(unittest.TestCase):
         self.assertEqual(main.task_status["failure_count"], 6)
         self.assertNotIn("Stopped early", main.task_status["message"])
 
+    def test_stopping_early_parks_ingestion_behind_a_cooldown(self):
+        def fake_fetch(video_id, languages=None):
+            raise RuntimeError("YouTube is blocking requests from your IP")
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(20)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=1):
+            self.client.post("/api/fetch/channel", json={"url": "https://youtube.com/@test", "limit": 20})
+
+        cooldown = self.client.get("/api/fetch/cooldown").json()
+        self.assertTrue(cooldown["active"])
+        self.assertEqual(cooldown["strikes"], 1)
+        self.assertGreater(cooldown["remaining_seconds"], 0)
+        self.assertIn("Ingestion paused", main.task_status["message"])
+
+        # The whole point: the next run does not walk back into the same block.
+        blocked = self.client.post("/api/fetch/channel", json={"url": "https://youtube.com/@test"})
+        self.assertEqual(blocked.status_code, 429)
+        self.assertIn("rate limited", blocked.json()["detail"].lower())
+
+        blocked_video = self.client.post("/api/fetch/video", json={"url": "https://youtube.com/watch?v=abcdefghijk"})
+        self.assertEqual(blocked_video.status_code, 429)
+
+    def test_cancelling_during_a_backoff_does_not_park_ingestion(self):
+        def fake_fetch(video_id, languages=None):
+            raise RuntimeError("YouTube is blocking requests from your IP")
+
+        def cancel_mid_sleep(_seconds):
+            main.task_cancel_event.set()
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(20)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", side_effect=cancel_mid_sleep), \
+             patch.object(main.random, "uniform", return_value=1):
+            self.client.post("/api/fetch/channel", json={"url": "https://youtube.com/@test", "limit": 20})
+
+        self.assertFalse(self.client.get("/api/fetch/cooldown").json()["active"])
+        self.assertIn("cancel", main.task_status["message"].lower())
+
+    def test_cooldown_can_be_cleared_deliberately(self):
+        main.reliability_store.start_cooldown(600, reason="test")
+        self.assertTrue(self.client.get("/api/fetch/cooldown").json()["active"])
+
+        cleared = self.client.post("/api/fetch/cooldown/clear")
+
+        self.assertEqual(cleared.status_code, 200)
+        self.assertFalse(cleared.json()["active"])
+        self.assertEqual(cleared.json()["strikes"], 0)
+        self.assertFalse(self.client.get("/api/fetch/cooldown").json()["active"])
+
+    def test_repeat_blocks_escalate_the_cooldown(self):
+        first = main.reliability_store.start_cooldown(main.RATE_LIMIT_COOLDOWN_SECONDS[0])
+        second = main.reliability_store.start_cooldown(main.RATE_LIMIT_COOLDOWN_SECONDS[1])
+
+        self.assertEqual(first["strikes"], 1)
+        self.assertEqual(second["strikes"], 2)
+        self.assertGreater(second["remaining_seconds"], first["remaining_seconds"])
+
+    def test_a_clean_run_clears_a_lapsed_strike_count(self):
+        main.reliability_store.start_cooldown(0, reason="expired immediately")
+        self.assertFalse(main.reliability_store.get_cooldown()["active"])
+        self.assertEqual(main.reliability_store.get_cooldown()["strikes"], 1)
+
+        def fake_fetch(video_id, languages=None):
+            return sample_entry(video_id, "Clean")
+
+        with patch.object(main, "list_channel_videos", side_effect=lambda channel, limit=None, **kw: deep_listing(2)), \
+             patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
+             patch.object(main.time, "sleep", return_value=None), \
+             patch.object(main.random, "uniform", return_value=0):
+            response = self.client.post("/api/fetch/channel", json={"url": "https://youtube.com/@test", "limit": 20})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(main.reliability_store.get_cooldown()["strikes"], 0)
+
+    def test_watcher_does_not_run_while_cooling_down(self):
+        main.reliability_store.update_settings({
+            "enabled": True,
+            "channels": ["https://youtube.com/@test"],
+            "frequency_minutes": 30,
+        })
+        settings = main.reliability_store.get_settings()
+        self.assertTrue(main.watcher_due(settings))
+
+        main.reliability_store.start_cooldown(900, reason="blocked")
+
+        self.assertFalse(main.watcher_due(main.reliability_store.get_settings()))
+
+    def test_backoff_waits_are_jittered_rather_than_fixed(self):
+        base = main.RATE_LIMIT_BACKOFF_SECONDS[0]
+        samples = {main._jittered(base) for _ in range(60)}
+
+        self.assertGreater(len(samples), 1, "a fixed wait is a machine signature")
+        self.assertTrue(all(value >= 1 for value in samples))
+        self.assertTrue(
+            all(
+                base * (1 - main.RATE_LIMIT_JITTER) - 1 <= value <= base * (1 + main.RATE_LIMIT_JITTER) + 1
+                for value in samples
+            )
+        )
+
+    def test_backoff_bases_are_not_round_numbers(self):
+        for base in main.RATE_LIMIT_BACKOFF_SECONDS + main.RATE_LIMIT_COOLDOWN_SECONDS:
+            self.assertNotEqual(base % 10, 0, f"{base} is a round number")
+
     def test_channel_preview_marks_already_saved_titles(self):
         main.store.add_entry(sample_entry("deepvideo000", "Already archived"))
 
