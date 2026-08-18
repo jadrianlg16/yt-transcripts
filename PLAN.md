@@ -317,6 +317,12 @@ Concretely, in priority order:
    and the next successful fetch, and calibrate from the observed distribution. That
    belongs with 9.5, which is the same argument applied to retrieval.
 2. **Drain a queue instead of running bursts.** The watcher already runs on a timer.
+   Measured 2026-08-18, and the numbers argue for this directly: a 20-video batch
+   finished clean, and a second batch started immediately after got 12 more before the
+   block hit, at roughly 32 cumulative fetches. The first burst that ever tripped it
+   stopped near 24 in one run. So **the limit tracks requests over a rolling window, not
+   requests per run** — splitting one burst into two back-to-back batches buys nothing.
+   Batch size is not the lever; rate over time is.
    Turning "fetch 40 now" into "fetch a few every N minutes until the backlog is
    empty" fits the tool's real usage and stays under the limit. This subsumes the
    current retry-failed flow.
