@@ -841,9 +841,10 @@ def _fetch_and_save_video(
 # exactly 30/90/180 seconds every time is a machine signature, and the point of
 # backing off is to look less like something worth blocking.
 RATE_LIMIT_BACKOFF_SECONDS = (43, 118, 227)
-# Once a run gives up, hold off new work entirely. Observed blocks have outlasted
-# an hour, so these are minutes rather than seconds, and escalate per strike.
-RATE_LIMIT_COOLDOWN_SECONDS = (1_307, 3_067, 5_881)  # ~22m, ~51m, ~98m
+# Once a run gives up, hold off new work entirely, escalating per strike. Sized from
+# observation, not taste: a ~14 minute wait was measured as still too short, and blocks
+# have outlasted an hour. Waits below roughly twenty minutes only buy a wasted probe.
+RATE_LIMIT_COOLDOWN_SECONDS = (2_311, 4_703, 8_419)  # ~38m, ~78m, ~140m
 RATE_LIMIT_JITTER = 0.4
 RATE_LIMIT_MARKERS = ("blocking requests", "too many requests", "429")
 
