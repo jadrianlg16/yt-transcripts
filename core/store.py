@@ -81,6 +81,30 @@ class JsonTranscriptStore:
     def saved_video_ids(self):
         return {str(e.get("video_id")) for e in self.data if e.get("video_id")}
 
+    def list_summaries(self):
+        """Same shape as the SQLite store: list fields only, no transcript bodies."""
+        summaries = []
+        for entry in self.data:
+            segments = entry.get("segments") or []
+            duration = max(
+                (
+                    float(s.get("start") or 0) + float(s.get("duration") or 0)
+                    for s in segments
+                    if isinstance(s, dict)
+                ),
+                default=0.0,
+            )
+            summaries.append({
+                "video_id": entry.get("video_id", ""),
+                "title": entry.get("title", ""),
+                "channel": entry.get("channel", ""),
+                "saved_at": entry.get("saved_at", ""),
+                "transcript_char_count": len(str(entry.get("transcript") or "")),
+                "segment_count": len(segments),
+                "duration_seconds": round(duration, 2),
+            })
+        return summaries
+
 
 class TranscriptStore(JsonTranscriptStore):
     pass

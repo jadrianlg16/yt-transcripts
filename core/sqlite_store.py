@@ -12,6 +12,8 @@ from core.store import normalize_display_text, normalize_entry_display_fields
 
 DEFAULT_DB_FILE = "transcripts_store.sqlite3"
 UNKNOWN_CHANNEL = "Unknown Channel"
+# Wait for a competing writer rather than failing instantly.
+BUSY_TIMEOUT_SECONDS = 15.0
 
 
 class SQLiteTranscriptStore:
@@ -19,15 +21,47 @@ class SQLiteTranscriptStore:
         self.db_path = Path(db_path)
         if self.db_path.parent != Path("."):
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._enable_wal()
         self.fts_enabled = self._initialize_schema()
-        if self.fts_enabled:
+        # Rebuilding the whole index on construction is a heavy write that competes
+        # with every reader for no benefit when the index is already current.
+        if self.fts_enabled and self._fts_is_stale():
             self.rebuild_fts()
 
+    def _enable_wal(self) -> None:
+        """Let readers and writers work at the same time.
+
+        The default rollback journal makes a reader block a writer, so a slow read
+        of the archive can push a transcript save past its busy timeout and fail it
+        with "database is locked". WAL is stored in the file, so this only has to
+        take effect once.
+        """
+        try:
+            connection = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.commit()
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            # A read-only or exotic filesystem keeps the old journal mode. Slower
+            # under contention, but still correct.
+            pass
+
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    def _fts_is_stale(self) -> bool:
+        try:
+            with self._connection() as connection:
+                indexed = connection.execute("SELECT COUNT(*) FROM video_search_fts").fetchone()[0]
+                stored = connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+                return int(indexed) != int(stored)
+        except sqlite3.Error:
+            return True
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -166,6 +200,49 @@ class SQLiteTranscriptStore:
         with self._connection() as connection:
             rows = connection.execute("SELECT video_id FROM videos").fetchall()
             return {str(row["video_id"]) for row in rows if row["video_id"]}
+
+    def list_summaries(self) -> list[dict[str, Any]]:
+        """Everything the library list renders, and nothing it does not.
+
+        `all_entries` ships every transcript body and every segment row, which for a
+        modest archive is already megabytes per request and seconds of read lock. The
+        list only shows a title, a channel, and a date.
+        """
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    videos.video_id,
+                    videos.title,
+                    channels.name AS channel,
+                    videos.saved_at,
+                    LENGTH(videos.transcript) AS transcript_char_count,
+                    (
+                        SELECT COUNT(*) FROM segments
+                        WHERE segments.video_id = videos.video_id
+                    ) AS segment_count,
+                    (
+                        SELECT COALESCE(MAX(segments.start + segments.duration), 0)
+                        FROM segments WHERE segments.video_id = videos.video_id
+                    ) AS duration_seconds
+                FROM videos
+                JOIN channels ON channels.id = videos.channel_id
+                ORDER BY videos.sort_order ASC, videos.created_at ASC
+                """
+            ).fetchall()
+
+        return [
+            normalize_entry_display_fields({
+                "video_id": row["video_id"],
+                "title": row["title"],
+                "channel": row["channel"],
+                "saved_at": row["saved_at"],
+                "transcript_char_count": int(row["transcript_char_count"] or 0),
+                "segment_count": int(row["segment_count"] or 0),
+                "duration_seconds": round(float(row["duration_seconds"] or 0), 2),
+            })
+            for row in rows
+        ]
 
     def all_entries(self) -> list[dict[str, Any]]:
         with self._connection() as connection:

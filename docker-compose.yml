@@ -37,7 +37,10 @@ services:
       YT_TRANSCRIPTS_OLLAMA_BASE_URL: http://host.docker.internal:11434/api
       TRANSCRIPT_STORE_BACKEND: sqlite
     volumes:
-      - ./data:/app/data:ro
+      # Not :ro. WAL needs to create its -shm sidecar even for readers, and a
+      # read-only mount makes the database unopenable. mcp_server.py still opens
+      # SQLite with mode=ro, so writes are rejected by SQLite itself.
+      - ./data:/app/data
     depends_on:
       backend:
         condition: service_healthy

@@ -228,5 +228,111 @@ class ChannelNameNormalizationTests(unittest.TestCase):
             self.assertEqual(store.normalize_channel_names(), {"renamed": 0, "merged": 0})
 
 
+class ConcurrencyAndListPayloadTests(unittest.TestCase):
+    """The three settings behind the 'database is locked' failures."""
+
+    def _store(self, temp_dir, count=3):
+        store = SQLiteTranscriptStore(os.path.join(temp_dir, "transcripts.db"))
+        for index in range(count):
+            store.add_entry(
+                sample_entry(f"video{index:07d}", f"Title {index}", "one. two. three.")
+            )
+        return store
+
+    def test_database_uses_wal_so_readers_do_not_block_writers(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "transcripts.db")
+            SQLiteTranscriptStore(db_path)
+
+            with sqlite3.connect(db_path) as connection:
+                mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+
+            self.assertEqual(mode.lower(), "wal")
+
+    def test_a_write_succeeds_while_a_reader_holds_the_database(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self._store(temp_dir)
+            db_path = os.path.join(temp_dir, "transcripts.db")
+
+            # Hold an open read transaction, which under the old journal mode
+            # would block the write until it timed out.
+            reader = sqlite3.connect(db_path)
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM segments").fetchone()
+            try:
+                store.add_entry(sample_entry("video0000099", "Written anyway", "a. b."))
+            finally:
+                reader.close()
+
+            self.assertIn("video0000099", store.saved_video_ids())
+
+    def test_reopening_a_current_archive_does_not_rebuild_the_search_index(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._store(temp_dir)
+
+            reopened = SQLiteTranscriptStore(os.path.join(temp_dir, "transcripts.db"))
+
+            self.assertFalse(reopened._fts_is_stale())
+            # Reopening must not disturb what search returns.
+            self.assertEqual(len(reopened.search_entries("three")), 3)
+
+    def test_a_stale_search_index_is_still_rebuilt(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "transcripts.db")
+            self._store(temp_dir)
+            with sqlite3.connect(db_path) as connection:
+                connection.execute("DELETE FROM video_search_fts")
+
+            reopened = SQLiteTranscriptStore(db_path)
+
+            self.assertFalse(reopened._fts_is_stale())
+            self.assertEqual(len(reopened.search_entries("three")), 3)
+
+    def test_list_summaries_leave_out_transcript_bodies_and_segments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self._store(temp_dir)
+
+            summaries = store.list_summaries()
+
+            self.assertEqual(len(summaries), 3)
+            row = summaries[0]
+            self.assertNotIn("transcript", row)
+            self.assertNotIn("segments", row)
+            self.assertEqual(
+                sorted(row),
+                ["channel", "duration_seconds", "saved_at", "segment_count",
+                 "title", "transcript_char_count", "video_id"],
+            )
+
+    def test_list_summaries_keep_the_counts_the_list_sorts_on(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self._store(temp_dir, count=1)
+
+            summary = store.list_summaries()[0]
+            full = store.all_entries()[0]
+
+            self.assertEqual(summary["segment_count"], len(full["segments"]))
+            self.assertEqual(summary["transcript_char_count"], len(full["transcript"]))
+            expected = max(s["start"] + s["duration"] for s in full["segments"])
+            self.assertAlmostEqual(summary["duration_seconds"], round(expected, 2))
+
+    def test_both_backends_return_the_same_summary_shape(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sqlite_store = self._store(temp_dir, count=1)
+            json_store = JsonTranscriptStore(os.path.join(temp_dir, "transcripts.json"))
+            json_store.add_entry(sample_entry("video0000000", "Title 0", "one. two. three."))
+
+            self.assertEqual(
+                sorted(sqlite_store.list_summaries()[0]),
+                sorted(json_store.list_summaries()[0]),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

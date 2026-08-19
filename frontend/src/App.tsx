@@ -57,8 +57,13 @@ interface Transcript {
   uploaded_at?: string;
   fetched_at?: string;
   source_url?: string;
-  transcript: string;
-  segments: Segment[];
+  /** Absent on list rows from /api/transcripts; present on a fetched detail. */
+  transcript?: string;
+  segments?: Segment[];
+  /** Precomputed on list rows so the list never needs the segments. */
+  transcript_char_count?: number;
+  segment_count?: number;
+  duration_seconds?: number;
 }
 
 interface TaskStatus {
@@ -810,6 +815,8 @@ const countWords = (text: string) => (
 );
 
 const getTranscriptRuntime = (transcript: Transcript | null | undefined) => {
+  // List rows carry a precomputed duration; only a fetched detail has segments.
+  if (transcript?.duration_seconds != null) return transcript.duration_seconds;
   if (!transcript?.segments?.length) return 0;
 
   return Math.max(...transcript.segments.map(segment => segment.start + segment.duration));
@@ -2206,7 +2213,7 @@ function App() {
     if (!currentTranscript) return;
 
     try {
-      await navigator.clipboard.writeText(currentTranscript.transcript);
+      await navigator.clipboard.writeText(currentTranscript.transcript ?? '');
       addLog('Copied transcript to clipboard', 'success');
     } catch {
       addLog('Failed to copy transcript', 'error');
@@ -2309,6 +2316,16 @@ function App() {
     result.match_count ?? result.matches?.length ?? countQueryMatches(transcriptById.get(result.video_id)?.transcript ?? '', searchQuery)
   ), [searchQuery, transcriptById]);
 
+  /** Body matches for the current query, resolved by the backend rather than by
+   *  scanning every transcript in the browser. */
+  const searchResultIds = useMemo(() => (
+    new Set(searchResults.map(result => result.video_id))
+  ), [searchResults]);
+
+  const matchCountById = useMemo(() => new Map(
+    searchResults.map(result => [result.video_id, result.match_count ?? result.matches?.length ?? 0])
+  ), [searchResults]);
+
   const filteredTranscripts = useMemo(() => transcripts.filter(transcript => {
     const query = searchQuery.toLowerCase();
     const matchesChannel = channelFilter === 'all' || transcript.channel === channelFilter;
@@ -2316,11 +2333,11 @@ function App() {
     const matchesQuery = !query ||
       transcript.title.toLowerCase().includes(query) ||
       transcript.channel.toLowerCase().includes(query) ||
-      transcript.transcript.toLowerCase().includes(query) ||
-      tags.some(tag => tag.includes(query));
+      tags.some(tag => tag.includes(query)) ||
+      searchResultIds.has(transcript.video_id);
 
     return matchesChannel && matchesQuery;
-  }), [channelFilter, researchOrg.tags, searchQuery, transcripts]);
+  }), [channelFilter, researchOrg.tags, searchQuery, searchResultIds, transcripts]);
 
   const sortedTranscripts = useMemo(() => [...filteredTranscripts].sort((a, b) => {
     const effectiveSort = sortBy === 'relevance' ? 'newest' : sortBy;
@@ -2334,11 +2351,11 @@ function App() {
     }
 
     if (effectiveSort === 'most_matches') {
-      return countQueryMatches(b.transcript, searchQuery) - countQueryMatches(a.transcript, searchQuery);
+      return (matchCountById.get(b.video_id) ?? 0) - (matchCountById.get(a.video_id) ?? 0);
     }
 
     return parseDisplayDateMillis(getDisplayDateValue(b)) - parseDisplayDateMillis(getDisplayDateValue(a));
-  }), [filteredTranscripts, searchQuery, sortBy]);
+  }), [filteredTranscripts, matchCountById, sortBy]);
 
   const sortedSearchResults = useMemo(() => [...searchResults].sort((a, b) => {
     if (sortBy === 'title') {
@@ -2365,10 +2382,10 @@ function App() {
     : null;
 
   const selectedSummary = currentTranscript ? {
-    wordCount: selectedSearchResult?.word_count ?? countWords(currentTranscript.transcript),
+    wordCount: selectedSearchResult?.word_count ?? countWords(currentTranscript.transcript ?? ''),
     runtime: selectedSearchResult ? getSearchResultRuntime(selectedSearchResult) : getTranscriptRuntime(currentTranscript),
     segmentCount: selectedSearchResult?.segment_count ?? currentTranscript.segments?.length ?? 0,
-    matchCount: selectedSearchResult?.match_count ?? selectedSearchResult?.matches?.length ?? countQueryMatches(currentTranscript.transcript, searchQuery),
+    matchCount: selectedSearchResult?.match_count ?? selectedSearchResult?.matches?.length ?? countQueryMatches(currentTranscript.transcript ?? '', searchQuery),
   } : null;
 
   const currentTags = currentTranscript ? researchOrg.tags[currentTranscript.video_id] ?? [] : [];
@@ -3044,7 +3061,7 @@ function App() {
               const transcript = transcriptById.get(result.video_id);
               const title = result.title || transcript?.title || result.video_id || 'Untitled video';
               const channel = result.channel || transcript?.channel || 'Unknown channel';
-              const excerpt = result.excerpt || result.matches[0]?.text || transcript?.transcript.slice(0, 280) || '';
+              const excerpt = result.excerpt || result.matches[0]?.text || transcript?.transcript?.slice(0, 280) || '';
               const score = result.semantic_score ?? result.similarity ?? result.score;
 
               return (
@@ -3467,7 +3484,7 @@ function App() {
               )}
 
               <div className="space-y-3">
-                {currentTranscript.segments?.length > 0 ? currentTranscript.segments.map((segment, index) => {
+                {(currentTranscript.segments?.length ?? 0) > 0 ? (currentTranscript.segments ?? []).map((segment, index) => {
                   const draftKey = `${segment.start}`;
                   return (
                     <div key={`${segment.start}-${index}`} className="rounded-lg border border-slate-200 p-3">
@@ -3503,7 +3520,7 @@ function App() {
                     </div>
                   );
                 }) : (
-                  <p className="whitespace-pre-wrap text-base leading-7 text-slate-700">{renderHighlightedText(currentTranscript.transcript)}</p>
+                  <p className="whitespace-pre-wrap text-base leading-7 text-slate-700">{renderHighlightedText(currentTranscript.transcript ?? '')}</p>
                 )}
               </div>
             </>

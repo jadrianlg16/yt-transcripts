@@ -1399,9 +1399,17 @@ class DataExportRequest(BaseModel):
     include_segments: bool = True
 
 
+def transcript_summaries() -> list[dict[str, Any]]:
+    reader = getattr(store, "list_summaries", None)
+    if callable(reader):
+        return reader()
+    return store.all_entries()
+
+
 @app.get("/api/transcripts")
 def get_transcripts():
-    return list(reversed(store.all_entries()))
+    """List rows only. Fetch /api/transcripts/{video_id} for a transcript body."""
+    return list(reversed(transcript_summaries()))
 
 @app.get("/api/stats")
 def get_stats():
