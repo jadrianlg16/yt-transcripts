@@ -147,16 +147,19 @@ class Stage5ApiTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_channel_fetch_records_partial_failure_and_retry_run_saves_video(self):
-        videos = [{"videoId": "success0001"}, {"videoId": "failure0001"}]
+        rss_entries = [
+            {"video_id": "success0001", "title": "Works", "url": ""},
+            {"video_id": "failure0001", "title": "Broken", "url": ""},
+        ]
 
         def fake_fetch(video_id, languages=None):
             if video_id == "failure0001":
                 raise RuntimeError("Transcript disabled")
             return sample_entry(video_id, "Fetched success")
 
-        with patch.object(main.scrapetube, "get_channel", return_value=videos), \
-             patch.object(main, "list_channel_videos", side_effect=RuntimeError("channel page unavailable")), \
-             patch.object(main, "fetch_channel_rss_entries", side_effect=RuntimeError("RSS unavailable")), \
+        # Channel page unavailable, so the listing falls back to RSS.
+        with patch.object(main, "list_channel_videos", side_effect=RuntimeError("channel page unavailable")), \
+             patch.object(main, "fetch_channel_rss_entries", return_value=rss_entries), \
              patch.object(main, "fetch_video_full", side_effect=fake_fetch), \
              patch.object(main.time, "sleep", return_value=None), \
              patch.object(main.random, "uniform", return_value=0):
@@ -436,6 +439,28 @@ class Stage5ApiTests(unittest.TestCase):
                 for value in samples
             )
         )
+
+    def test_pacing_is_slow_and_uneven_enough_to_stay_under_the_limit(self):
+        gaps = [main._video_gap_seconds(index) for index in range(1, 31)]
+
+        # Roughly two requests a minute, against the thirty that got runs cut off.
+        self.assertLess(30 / (sum(gaps) / 60), 5)
+        self.assertGreater(len(set(round(gap) for gap in gaps)), 5, "a fixed cadence is a signature")
+
+    def test_the_first_video_of_a_run_is_not_delayed(self):
+        self.assertEqual(main._video_gap_seconds(0), 0.0)
+
+    def test_a_run_takes_a_longer_pause_periodically(self):
+        every = main.LONG_PAUSE_EVERY
+        self.assertGreaterEqual(main._video_gap_seconds(every), min(main.LONG_PAUSE_SECONDS))
+        self.assertLessEqual(main._video_gap_seconds(every - 1), max(main.VIDEO_GAP_SECONDS))
+
+    def test_pacing_stops_immediately_when_the_run_is_cancelled(self):
+        main.task_cancel_event.set()
+        try:
+            self.assertFalse(main._pace_next_video(1))
+        finally:
+            main.task_cancel_event.clear()
 
     def test_backoff_bases_are_not_round_numbers(self):
         for base in main.RATE_LIMIT_BACKOFF_SECONDS + main.RATE_LIMIT_COOLDOWN_SECONDS:

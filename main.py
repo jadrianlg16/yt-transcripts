@@ -13,7 +13,6 @@ import re
 import sqlite3
 import time
 import random
-import scrapetube
 import threading
 import urllib.error
 import urllib.request
@@ -846,6 +845,12 @@ RATE_LIMIT_BACKOFF_SECONDS = (43, 118, 227)
 # have outlasted an hour. Waits below roughly twenty minutes only buy a wasted probe.
 RATE_LIMIT_COOLDOWN_SECONDS = (2_311, 4_703, 8_419)  # ~38m, ~78m, ~140m
 RATE_LIMIT_JITTER = 0.4
+# Pacing between videos in a run. The old 1-3s gap put roughly 30 requests a minute
+# through YouTube, which is about where it starts refusing. These are slower and far
+# less even, and every so often the run takes a longer pause the way a person would.
+VIDEO_GAP_SECONDS = (7.0, 23.0)
+LONG_PAUSE_EVERY = 5
+LONG_PAUSE_SECONDS = (47.0, 131.0)
 RATE_LIMIT_MARKERS = ("blocking requests", "too many requests", "429")
 
 
@@ -853,6 +858,31 @@ def _jittered(seconds: float, jitter: float = RATE_LIMIT_JITTER) -> int:
     """Spread a delay around its base so repeated waits never repeat exactly."""
     spread = max(0.0, min(jitter, 0.9))
     return max(1, int(seconds * random.uniform(1 - spread, 1 + spread)))
+
+
+def _video_gap_seconds(index: int) -> float:
+    """How long to wait before the next video in a run.
+
+    Irregular by design. A fixed cadence is both easy to spot and, at the old
+    speed, fast enough to get the run cut off partway through.
+    """
+    if index == 0:
+        return 0.0
+    if index % LONG_PAUSE_EVERY == 0:
+        return random.uniform(*LONG_PAUSE_SECONDS)
+    return random.uniform(*VIDEO_GAP_SECONDS)
+
+
+def _pace_next_video(index: int) -> bool:
+    """Sleep between videos, staying responsive to a cancel request."""
+    remaining = _video_gap_seconds(index)
+    while remaining > 0:
+        if _task_cancel_requested():
+            return False
+        slice_seconds = min(1.0, remaining)
+        time.sleep(slice_seconds)
+        remaining -= slice_seconds
+    return True
 
 
 def _is_rate_limited(error: Exception | str) -> bool:
@@ -1034,29 +1064,18 @@ def fetch_channel_rss_entries(channel: str) -> list[dict[str, str]]:
 
 # YouTube's RSS feed always returns the 15 newest uploads and nothing older, so it
 # is only enough for incremental "what is new since last time" checks. Anything
-# deeper has to come from the paginated browse listing that scrapetube walks.
+# deeper has to come from the channel page grid that core/channel_listing.py walks.
 RSS_FEED_DEPTH = 15
 DEFAULT_CHANNEL_FETCH_LIMIT = 30
 MAX_CHANNEL_FETCH_LIMIT = 500
 
 
-def _scrapetube_title(video: dict[str, Any]) -> str:
-    title = video.get("title")
-    if isinstance(title, dict):
-        runs = title.get("runs")
-        if isinstance(runs, list) and runs:
-            return str(runs[0].get("text") or "").strip()
-        return str(title.get("simpleText") or "").strip()
-    return str(title or "").strip()
+def _candidate_title(video: dict[str, Any]) -> str:
+    return str(video.get("title") or "").strip()
 
 
-def _scrapetube_published(video: dict[str, Any]) -> str:
-    if video.get("published_text"):
-        return str(video["published_text"]).strip()
-    published = video.get("publishedTimeText")
-    if isinstance(published, dict):
-        return str(published.get("simpleText") or "").strip()
-    return str(published or "").strip()
+def _candidate_published(video: dict[str, Any]) -> str:
+    return str(video.get("published_text") or "").strip()
 
 
 def _normalize_candidate(video: dict[str, Any]) -> dict[str, str] | None:
@@ -1065,9 +1084,9 @@ def _normalize_candidate(video: dict[str, Any]) -> dict[str, str] | None:
         return None
     return {
         "videoId": video_id,
-        "title": _scrapetube_title(video) or str(video.get("title") or ""),
+        "title": _candidate_title(video),
         "url": str(video.get("url") or "") or youtube_watch_url(video_id) or "",
-        "published_text": _scrapetube_published(video),
+        "published_text": _candidate_published(video),
     }
 
 
@@ -1087,46 +1106,6 @@ def _channel_page_candidates(channel_url: str, limit: int | None) -> tuple[list[
     """Read the channel page grid directly. This is the only source that pages deep."""
     videos = list_channel_videos(channel_url, limit=limit)
     return [c for c in (_normalize_candidate(v) for v in videos) if c], "channel_page"
-
-
-def _scrapetube_candidates(channel_url: str, limit: int | None) -> tuple[list[dict[str, str]], str]:
-    """Walk the channel's browse listing, newest first, across videos and streams."""
-    errors: list[str] = []
-    handle = channel_url.split("@")[-1].split("/")[0] if "@" in channel_url else None
-    lookups: list[tuple[str, dict[str, Any]]] = [("scrapetube:url", {"channel_url": channel_url})]
-    if handle:
-        lookups.append(("scrapetube:handle", {"channel_username": handle}))
-
-    for source, kwargs in lookups:
-        collected: list[dict[str, str]] = []
-        used_types: list[str] = []
-        for content_type in ("videos", "streams"):
-            remaining = None if limit is None else limit - len(collected)
-            if remaining is not None and remaining <= 0:
-                break
-            try:
-                videos = list(
-                    scrapetube.get_channel(
-                        **kwargs,
-                        limit=remaining,
-                        sort_by="newest",
-                        content_type=content_type,
-                    )
-                )
-            except Exception as exc:
-                errors.append(f"{source}/{content_type} lookup failed: {exc}")
-                continue
-            normalized = [c for c in (_normalize_candidate(v) for v in videos) if c]
-            if normalized:
-                used_types.append(content_type)
-                collected.extend(normalized)
-
-        if collected:
-            return _dedupe_candidates(collected), f"{source}:{'+'.join(used_types)}"
-
-    if errors:
-        raise ValueError("; ".join(errors))
-    return [], "none"
 
 
 def fetch_channel_video_candidates(
@@ -1165,13 +1144,6 @@ def fetch_channel_video_candidates(
             return videos, source
     except Exception as exc:
         errors.append(f"channel page lookup failed: {exc}")
-
-    try:
-        videos, source = _scrapetube_candidates(channel_url, limit)
-        if videos:
-            return videos, source
-    except Exception as exc:
-        errors.append(str(exc))
 
     # Deep listing failed; the 15 newest are better than nothing.
     if wants_deep_listing:
@@ -2393,7 +2365,9 @@ def background_channel_fetch(
             # Check if exists in folder already (though we use time-stamped folders now)
 
             try:
-                time.sleep(random.uniform(1, 3)) # politeness
+                if not _pace_next_video(i - 1):
+                    _finish_canceled_task(run_id)
+                    return
                 entry = _fetch_and_save_video(v_id, run_id=run_id, index=i, total=total, url=source_url)
                 rate_limit_streak = 0
 
