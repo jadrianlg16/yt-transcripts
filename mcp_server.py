@@ -252,7 +252,35 @@ def _load_json_entries(path: Path) -> list[dict[str, Any]]:
     )
 
 
+# Every tool call used to re-read the whole archive from disk. The archive only
+# changes when the backend saves a transcript, so a cache keyed on the file's
+# modification time and size stays correct and skips the reload.
+_ARCHIVE_CACHE: dict[str, Any] = {"key": None, "entries": None, "storage": None}
+_STATS_CACHE: dict[str, Any] = {"key": None, "value": None}
+
+
+def _archive_cache_key() -> tuple[Any, ...] | None:
+    for path in (_data_path(SQLITE_DATA_FILE), _data_path(DATA_FILE)):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        return (str(path), stat.st_mtime_ns, stat.st_size)
+    return None
+
+
 def _load_transcripts() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    key = _archive_cache_key()
+    if key is not None and _ARCHIVE_CACHE["key"] == key:
+        return _ARCHIVE_CACHE["entries"], _ARCHIVE_CACHE["storage"]
+
+    entries, storage = _read_transcripts()
+    if key is not None:
+        _ARCHIVE_CACHE.update({"key": key, "entries": entries, "storage": storage})
+    return entries, storage
+
+
+def _read_transcripts() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sqlite_path = _data_path(SQLITE_DATA_FILE)
     json_path = _data_path(DATA_FILE)
     warnings: list[str] = []
@@ -1074,8 +1102,13 @@ def get_library_stats() -> dict[str, Any]:
         return _mcp_disabled_response()
 
     entries, storage = _load_transcripts()
+    # Counting words across every transcript is the slow part; reuse it while the
+    # archive is unchanged.
+    key = _archive_cache_key()
+    if key is None or _STATS_CACHE["key"] != key:
+        _STATS_CACHE.update({"key": key, "value": library_stats(entries)})
     return {
-        "stats": library_stats(entries),
+        "stats": _STATS_CACHE["value"],
         "storage": storage,
     }
 

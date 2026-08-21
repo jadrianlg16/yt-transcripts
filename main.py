@@ -1411,9 +1411,32 @@ def get_transcripts():
     """List rows only. Fetch /api/transcripts/{video_id} for a transcript body."""
     return list(reversed(transcript_summaries()))
 
+# Stats scan every transcript to count words and rank keywords, which is slow and
+# pointless to repeat while the archive is unchanged. Keyed on the archive file so
+# a new transcript invalidates it immediately.
+_STATS_CACHE: dict[str, Any] = {"key": None, "value": None}
+
+
+def _archive_fingerprint() -> tuple[Any, ...] | None:
+    for path in (data_path(SQLITE_DATA_FILE), data_path(DATA_FILE)):
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            continue
+        return (str(path), stat.st_mtime_ns, stat.st_size)
+    return None
+
+
 @app.get("/api/stats")
 def get_stats():
-    return library_stats(store.all_entries())
+    key = _archive_fingerprint()
+    if key is not None and _STATS_CACHE["key"] == key:
+        return _STATS_CACHE["value"]
+
+    value = library_stats(store.all_entries())
+    if key is not None:
+        _STATS_CACHE.update({"key": key, "value": value})
+    return value
 
 @app.get("/api/search")
 def search_transcripts(
