@@ -20,6 +20,7 @@ from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationSto
 from core.ai_clients import OllamaClientError, ollama_client_from_settings
 from core.ai_settings import DEFAULT_AI_SETTINGS_FILE, AISettingsStore
 from core.research import library_stats, search_entries, words
+from core.topics import build_topic_model, related_videos, top_topics, video_topics
 from core.runtime_settings import load_mcp_settings
 from core.semantic_search import load_semantic_index, search_semantic_items
 from core.store import DATA_FILE, SQLITE_DATA_FILE, normalize_entry_display_fields
@@ -257,6 +258,7 @@ def _load_json_entries(path: Path) -> list[dict[str, Any]]:
 # modification time and size stays correct and skips the reload.
 _ARCHIVE_CACHE: dict[str, Any] = {"key": None, "entries": None, "storage": None}
 _STATS_CACHE: dict[str, Any] = {"key": None, "value": None}
+_TOPIC_CACHE: dict[str, Any] = {"key": None, "model": None}
 
 
 def _archive_cache_key() -> tuple[Any, ...] | None:
@@ -1093,6 +1095,58 @@ def get_transcript(
     if include_segments:
         response.update(_capped_segments(entry, max_segments, max_segment_text_chars))
     return response
+
+
+def _topic_model(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    key = _archive_cache_key()
+    if key is None or _TOPIC_CACHE["key"] != key:
+        _TOPIC_CACHE.update({"key": key, "model": build_topic_model(entries)})
+    return _TOPIC_CACHE["model"]
+
+
+@mcp.tool()
+def list_topics(limit: int = 30) -> dict[str, Any]:
+    """Subjects that recur across the archive, ranked by how many videos share them.
+
+    Use this to see what the library is actually about before searching it.
+    """
+    if not _mcp_enabled():
+        return _mcp_disabled_response()
+
+    entries, storage = _load_transcripts()
+    model = _topic_model(entries)
+    return {
+        "topics": top_topics(model, limit=_bounded_int(limit, 30, 1, MAX_LIST_LIMIT)),
+        "video_count": model.get("video_count", 0),
+        "storage": storage,
+    }
+
+
+@mcp.tool()
+def get_related_videos(video_id: str, limit: int = 8) -> dict[str, Any]:
+    """Videos covering the same ground as this one, and the subjects they share.
+
+    Answers "what else talks about this" without needing a search query, which is
+    useful for following a thread across the archive.
+    """
+    if not _mcp_enabled():
+        return _mcp_disabled_response()
+
+    entries, storage = _load_transcripts()
+    entries_by_id = _transcript_lookup(entries)
+    if str(video_id) not in entries_by_id:
+        return {"found": False, "video_id": video_id, "message": "Transcript not found", "storage": storage}
+
+    model = _topic_model(entries)
+    return {
+        "found": True,
+        "video_id": video_id,
+        "topics": video_topics(model, video_id),
+        "related": related_videos(
+            model, video_id, entries_by_id, limit=_bounded_int(limit, 8, 1, 50)
+        ),
+        "storage": storage,
+    }
 
 
 @mcp.tool()

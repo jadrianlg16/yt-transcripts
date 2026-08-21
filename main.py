@@ -28,6 +28,8 @@ from core.fetcher import extract_video_id, fetch_video_full
 from core.fetch_reliability import DEFAULT_RELIABILITY_FILE, FetchReliabilityStore, youtube_watch_url
 from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationStore, utc_now
 from core.research import library_stats, search_entries
+from core.topics import build_topic_model, related_videos, top_topics, video_topics
+from core.vault import export_vault
 from core.sqlite_store import SQLiteTranscriptStore, export_entries_to_json, migrate_json_to_sqlite
 from core.ai_artifacts import DEFAULT_AI_ARTIFACTS_FILE, AIArtifactStore, transcript_hash
 from core.ai_clients import OllamaClientError, ollama_client_from_settings
@@ -99,6 +101,8 @@ MCP_TOOL_NAMES = [
     "list_collections",
     "get_collection_markdown",
     "semantic_search",
+    "list_topics",
+    "get_related_videos",
 ]
 
 DATA_TABLES = [
@@ -1399,6 +1403,53 @@ def _archive_fingerprint() -> tuple[Any, ...] | None:
     return None
 
 
+# Topic model over the whole archive. Cheap enough to rebuild (well under a second
+# for a few hundred videos) but pointless to redo while nothing has been saved.
+_TOPIC_CACHE: dict[str, Any] = {"key": None, "model": None}
+
+
+def _topic_model() -> dict[str, Any]:
+    key = _archive_fingerprint()
+    if key is not None and _TOPIC_CACHE["key"] == key:
+        return _TOPIC_CACHE["model"]
+
+    model = build_topic_model(store.all_entries())
+    if key is not None:
+        _TOPIC_CACHE.update({"key": key, "model": model})
+    return model
+
+
+@app.get("/api/topics")
+def get_topics(limit: int = 30):
+    """Recurring subjects across the archive, ranked by how many videos share them."""
+    model = _topic_model()
+    return {
+        "topics": top_topics(model, limit=bounded_limit(limit, default=30, maximum=200)),
+        "video_count": model.get("video_count", 0),
+    }
+
+
+@app.get("/api/transcripts/{video_id}/related")
+def get_related_videos(video_id: str, limit: int = 8):
+    """Other videos covering the same ground, with the subjects they share."""
+    entries = store.all_entries()
+    entries_by_id = {str(e.get("video_id")): e for e in entries}
+    if video_id not in entries_by_id:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+
+    model = _topic_model()
+    return {
+        "video_id": video_id,
+        "topics": video_topics(model, video_id),
+        "related": related_videos(
+            model,
+            video_id,
+            entries_by_id,
+            limit=bounded_limit(limit, default=8, maximum=50),
+        ),
+    }
+
+
 @app.get("/api/stats")
 def get_stats():
     key = _archive_fingerprint()
@@ -1486,6 +1537,28 @@ def normalize_storage_channels():
 
     message = f"Renamed {result['renamed']} channels and merged {result['merged']} duplicates."
     record_event("info", "channels_normalized", message, result)
+    return {"status": "success", "message": message, **result}
+
+
+class VaultExportRequest(BaseModel):
+    folder_name: Optional[str] = None
+
+
+@app.post("/api/data/export-vault")
+def export_markdown_vault(request: VaultExportRequest):
+    """Write the archive as linked Markdown notes for Obsidian and similar tools."""
+    name = (request.folder_name or "vault").strip() or "vault"
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="folder_name must be a plain folder name")
+
+    try:
+        result = export_vault(store.all_entries(), EXPORTS_DIR / name)
+    except OSError as exc:
+        logger.exception("Vault export failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    message = f"Wrote {result['notes']} notes to {result['path']}"
+    record_event("info", "vault_exported", message, result)
     return {"status": "success", "message": message, **result}
 
 
