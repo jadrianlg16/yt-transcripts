@@ -97,6 +97,8 @@ function App() {
   const [channelPreviewBusy, setChannelPreviewBusy] = useState(false);
   const [followingChannel, setFollowingChannel] = useState(false);
   const [followBusy, setFollowBusy] = useState(false);
+  const [speechAvailable, setSpeechAvailable] = useState(false);
+  const [downloaderUrl, setDownloaderUrl] = useState('');
   const [selectedCandidates, setSelectedCandidates] = useState<string[]>([]);
   const [channelFilter, setChannelFilter] = useState('all');
   const [status, setStatus] = useState<TaskStatus>({ current_task: null, progress: 0, total: 0, message: 'Idle' });
@@ -763,6 +765,44 @@ function App() {
       reportApiError('Failed to update followed channels', error);
     } finally {
       setFollowBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [speech, downloader] = await Promise.all([
+          axios.get(`${API_BASE}/speech/status`),
+          axios.get(`${API_BASE}/downloader`),
+        ]);
+        if (cancelled) return;
+        setSpeechAvailable(Boolean(speech.data.available));
+        setDownloaderUrl(downloader.data.configured ? String(downloader.data.url) : '');
+      } catch {
+        if (!cancelled) {
+          setSpeechAvailable(false);
+          setDownloaderUrl('');
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleTranscribeBySpeech = async () => {
+    if (!currentTranscript || fetchRequestBusy || status.current_task) return;
+    const url = currentTranscript.source_url || `https://www.youtube.com/watch?v=${currentTranscript.video_id}`;
+    setFetchRequestBusy(true);
+    try {
+      const res = await axios.post(`${API_BASE}/fetch/speech`, { url, diarize: true });
+      markApiOnline();
+      setStatus(prev => ({ ...prev, run_id: res.data.run_id, current_task: 'speech', progress: 0, total: 1,
+        message: 'Speech transcription queued...', success_count: 0, failure_count: 0, skipped_count: 0 }));
+      addLog(`Re-transcribing ${currentTranscript.title} from audio`, 'info');
+    } catch (error) {
+      reportApiError('Failed to start speech transcription', error);
+    } finally {
+      setFetchRequestBusy(false);
     }
   };
 
@@ -2616,6 +2656,29 @@ function App() {
                   <ExternalLink className="h-4 w-4" />
                   YouTube
                 </a>
+                {downloaderUrl && (
+                  <a
+                    href={`${downloaderUrl}/?url=${encodeURIComponent(currentTranscript.source_url || `https://www.youtube.com/watch?v=${currentTranscript.video_id}`)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 font-medium text-slate-700 hover:bg-slate-200"
+                    title="Open this video in the downloader app"
+                  >
+                    <Download className="h-4 w-4" />
+                    Download
+                  </a>
+                )}
+                {speechAvailable && (
+                  <button
+                    onClick={handleTranscribeBySpeech}
+                    disabled={fetchRequestBusy || Boolean(status.current_task)}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 font-medium text-amber-800 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    title="Transcribe from the audio instead of the captions, with speaker labels"
+                  >
+                    <WandSparkles className="h-4 w-4" />
+                    {status.current_task === 'speech' ? 'Transcribing' : 'Re-transcribe'}
+                  </button>
+                )}
               </div>
             </div>
             <div className="grid grid-cols-3 gap-2 sm:flex sm:shrink-0">

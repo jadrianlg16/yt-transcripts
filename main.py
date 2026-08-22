@@ -23,7 +23,9 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from core.store import DATA_FILE, SQLITE_DATA_FILE, TranscriptRepository, create_transcript_store
+from core.audio import AudioDownloadError, audio_available, discard_audio, download_audio
 from core.channel_listing import list_channel_videos
+from core.speech import SpeechServiceError, service_health, speech_enabled, transcribe_file
 from core.fetcher import extract_video_id, fetch_video_full
 from core.fetch_reliability import DEFAULT_RELIABILITY_FILE, FetchReliabilityStore, youtube_watch_url
 from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationStore, utc_now
@@ -946,6 +948,81 @@ def _format_cooldown_wait(seconds: int) -> str:
         hours, minutes = divmod(minutes, 60)
         return f"{hours}h {minutes}m"
     return f"{minutes}m {remainder}s" if minutes else f"{remainder}s"
+
+
+# Captions are missing entirely for some videos, and no amount of retrying fixes
+# that. Whisper can still hear the audio.
+NO_CAPTION_MARKERS = (
+    "no transcript",
+    "transcripts disabled",
+    "subtitles are disabled",
+    "transcriptsdisabled",
+    "could not retrieve a transcript",
+)
+
+
+def _looks_like_missing_captions(error: Exception | str) -> bool:
+    """Distinguish "this video has no captions" from "YouTube is blocking us"."""
+    if _is_rate_limited(error):
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in NO_CAPTION_MARKERS)
+
+
+def speech_fallback_available() -> bool:
+    return speech_enabled() and audio_available()
+
+
+def _transcribe_with_speech_service(
+    video_id: str,
+    run_id: str,
+    diarize: bool = True,
+    model: str = "small",
+) -> dict[str, Any]:
+    """Download the audio, run it through the speech service, and store the result."""
+    if not speech_enabled():
+        raise SpeechServiceError("No speech service configured")
+    if not audio_available():
+        raise AudioDownloadError("yt-dlp is not installed")
+
+    update_task_status(message=f"Downloading audio for {video_id}...")
+    audio_path = download_audio(video_id)
+    try:
+        def report(status: dict[str, Any]) -> None:
+            update_task_status(message=f"Transcribing {video_id}: {status.get('stage') or 'working'}")
+
+        update_task_status(message=f"Transcribing {video_id} with speech recognition...")
+        result = transcribe_file(audio_path, diarize=diarize, model=model, on_progress=report)
+    finally:
+        discard_audio(audio_path)
+
+    segments = result["segments"]
+    if not segments:
+        raise SpeechServiceError("Speech service returned no speech")
+
+    metadata = fetch_metadata_details(video_id)
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    uploaded_at = metadata.get("uploaded_at") or fetched_at
+    entry = {
+        "video_id": video_id,
+        "title": metadata["title"],
+        "channel": metadata["channel"],
+        "saved_at": uploaded_at,
+        "uploaded_at": uploaded_at,
+        "fetched_at": fetched_at,
+        "source_url": youtube_watch_url(video_id),
+        "transcript": " ".join(s["text"] for s in segments),
+        "segments": segments,
+    }
+    store.add_entry(entry)
+    record_event("success", "speech_transcript_saved", f"Transcribed by speech: {entry['title']}", {
+        "run_id": run_id,
+        "video_id": video_id,
+        "segments": len(segments),
+        "language": result.get("language"),
+        "speakers": result.get("speaker_count"),
+    })
+    return entry
 
 
 def _record_fetch_failure(
@@ -2396,7 +2473,23 @@ def background_video_fetch(url: str, run_id: str | None = None):
             _finish_canceled_task(run_id)
             return
 
-        entry = _fetch_and_save_video(v_id, run_id=run_id, index=1, total=1, url=url)
+        try:
+            entry = _fetch_and_save_video(v_id, run_id=run_id, index=1, total=1, url=url)
+        except Exception as exc:
+            # A video with no captions is not a transient failure; retrying will never
+            # help, but the audio is still there to listen to.
+            if not (_looks_like_missing_captions(exc) and speech_fallback_available()):
+                raise
+            record_event("info", "speech_fallback_started", f"No captions for {v_id}; using speech recognition", {
+                "run_id": run_id,
+                "video_id": v_id,
+                "reason": str(exc)[:200],
+            })
+            entry = _transcribe_with_speech_service(v_id, run_id=run_id)
+            reliability_store.record_success(
+                run_id, video_id=v_id, title=entry.get("title", ""), index=1, total=1, url=url
+            )
+
         update_task_status(
             progress=1,
             success_count=1,
@@ -2602,6 +2695,77 @@ def _channel_fetch_limit(value: int | None) -> int | None:
     if value is None or value <= 0:
         return None
     return min(int(value), MAX_CHANNEL_FETCH_LIMIT)
+
+
+class SpeechTranscribeRequest(BaseModel):
+    url: str
+    diarize: bool = True
+    model: str = "small"
+
+
+@app.get("/api/downloader")
+def get_downloader_link():
+    """Where the downloader app lives, so the UI can link a video across to it.
+
+    Deliberately a link rather than an integration: that app queues by URL and its
+    API hands back no id for the item you just queued, so there is no dependable way
+    to follow your own download from here. It already has a UI for that.
+    """
+    base = os.getenv("YT_TRANSCRIPTS_DOWNLOADER_URL", "").strip().rstrip("/")
+    return {"configured": bool(base), "url": base}
+
+
+@app.get("/api/speech/status")
+def get_speech_status():
+    """Whether speech transcription can run, and why not when it cannot."""
+    health = service_health()
+    return {
+        **health,
+        "ytdlp_installed": audio_available(),
+        "available": speech_fallback_available() and health.get("reachable", False),
+    }
+
+
+def background_speech_transcribe(url: str, run_id: str, diarize: bool, model: str):
+    run_id = begin_task("speech", "Preparing speech transcription...", total=1, run_id=run_id)
+    reliability_store.start_run("speech", url, total=1, run_id=run_id)
+    try:
+        video_id = extract_video_id(url)
+        if not video_id:
+            raise ValueError("Invalid URL")
+
+        entry = _transcribe_with_speech_service(video_id, run_id=run_id, diarize=diarize, model=model)
+        reliability_store.record_success(
+            run_id, video_id=video_id, title=entry.get("title", ""), index=1, total=1, url=url
+        )
+        message = f"Transcribed by speech: {entry['title']}"
+        update_task_status(progress=1, success_count=1, message=message)
+        reliability_store.finish_run(run_id, message=message)
+        finish_task(message)
+    except Exception as exc:
+        logger.exception("Speech transcription failed")
+        update_task_status(message=f"Error: {exc}", failure_count=task_status["failure_count"] + 1)
+        _record_fetch_failure(run_id, exc, url=url)
+        reliability_store.finish_run(run_id, message=f"Error: {exc}")
+        record_event("error", "speech_transcribe_failed", str(exc), {"run_id": run_id, "url": url})
+        finish_task(f"Error: {exc}", level="error")
+
+
+@app.post("/api/fetch/speech")
+def fetch_by_speech(request: SpeechTranscribeRequest, background_tasks: BackgroundTasks):
+    """Transcribe a video from its audio, for captionless videos or speaker labels."""
+    _ensure_ingestion_allowed()
+    if not speech_fallback_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Speech transcription needs a speech service and yt-dlp. See /api/speech/status.",
+        )
+
+    run_id = queue_task("speech", "Speech transcription queued...", total=1)
+    background_tasks.add_task(
+        background_speech_transcribe, request.url, run_id, request.diarize, request.model
+    )
+    return {"status": "started", "run_id": run_id}
 
 
 @app.post("/api/fetch/channel/preview")

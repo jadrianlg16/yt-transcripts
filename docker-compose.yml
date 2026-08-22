@@ -13,6 +13,11 @@ services:
       YT_TRANSCRIPTS_HOST: 0.0.0.0
       YT_TRANSCRIPTS_OLLAMA_BASE_URL: http://host.docker.internal:11434/api
       TRANSCRIPT_STORE_BACKEND: sqlite
+      # Optional. Point this at the EchoScribe transcription service to enable
+      # speech transcription for videos YouTube publishes no captions for.
+      YT_TRANSCRIPTS_SPEECH_URL: ${YT_TRANSCRIPTS_SPEECH_URL:-}
+      # Where the downloader app lives, for the 'download this video' link.
+      YT_TRANSCRIPTS_DOWNLOADER_URL: ${YT_TRANSCRIPTS_DOWNLOADER_URL:-http://localhost:5013}
     volumes:
       - ./data:/app/data
     healthcheck:
