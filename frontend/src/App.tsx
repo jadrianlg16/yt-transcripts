@@ -4,6 +4,7 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  Bell,
   Bookmark,
   Bot,
   Brain,
@@ -867,6 +868,8 @@ function App() {
   const [channelLimit, setChannelLimit] = useState('30');
   const [channelPreview, setChannelPreview] = useState<ChannelPreview | null>(null);
   const [channelPreviewBusy, setChannelPreviewBusy] = useState(false);
+  const [followingChannel, setFollowingChannel] = useState(false);
+  const [followBusy, setFollowBusy] = useState(false);
   const [selectedCandidates, setSelectedCandidates] = useState<string[]>([]);
   const [channelFilter, setChannelFilter] = useState('all');
   const [status, setStatus] = useState<TaskStatus>({ current_task: null, progress: 0, total: 0, message: 'Idle' });
@@ -1484,6 +1487,55 @@ function App() {
       reportApiError('Failed to trigger video fetch', error);
     } finally {
       setFetchRequestBusy(false);
+    }
+  };
+
+  // Joined rather than the array itself: a fresh array on every settings poll
+  // would re-run the check below and cancel the one already in flight.
+  const followedChannelsKey = watcherSettings.channels.join('|');
+
+  useEffect(() => {
+    const channel = channelUrl.trim();
+    if (!channel) {
+      setFollowingChannel(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/watcher/following`, { params: { channel } });
+        if (!cancelled) setFollowingChannel(Boolean(res.data.following));
+      } catch {
+        if (!cancelled) setFollowingChannel(false);
+      }
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [channelUrl, followedChannelsKey]);
+
+  const handleToggleFollow = async () => {
+    const channel = channelUrl.trim();
+    if (!channel || followBusy) return;
+    setFollowBusy(true);
+    try {
+      const path = followingChannel ? 'unfollow' : 'follow';
+      const res = await axios.post(`${API_BASE}/watcher/${path}`, { channel });
+      markApiOnline();
+      setFollowingChannel(Boolean(res.data.following));
+      setWatcherSettings(prev => ({ ...prev, channels: res.data.channels ?? prev.channels }));
+      addLog(
+        res.data.following ? `Following ${channel}` : `Stopped following ${channel}`,
+        'success',
+      );
+      fetchWatcherSettings();
+    } catch (error) {
+      reportApiError('Failed to update followed channels', error);
+    } finally {
+      setFollowBusy(false);
     }
   };
 
@@ -2483,6 +2535,15 @@ function App() {
             value={channelLimit}
             onChange={(event) => setChannelLimit(event.target.value)}
           />
+          <button
+            onClick={handleToggleFollow}
+            disabled={!channelUrl.trim() || followBusy}
+            className={`${followingChannel ? primaryButtonClass : secondaryButtonClass} sm:w-32`}
+            title={followingChannel ? 'Stop checking this channel for new uploads' : 'Check this channel for new uploads automatically'}
+          >
+            <Bell className={`h-4 w-4 ${followBusy ? 'animate-pulse' : ''}`} />
+            {followingChannel ? 'Following' : 'Follow'}
+          </button>
           <button onClick={handlePreviewChannel} disabled={!channelUrl.trim() || channelPreviewBusy} className={`${secondaryButtonClass} sm:w-32`}>
             <ListPlus className={`h-4 w-4 ${channelPreviewBusy ? 'animate-spin' : ''}`} />
             {channelPreviewBusy ? 'Listing' : 'Preview'}

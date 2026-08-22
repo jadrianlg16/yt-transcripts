@@ -1276,6 +1276,10 @@ class RetryFailedRequest(BaseModel):
     run_id: str
 
 
+class FollowChannelRequest(BaseModel):
+    channel: str
+
+
 class WatcherSettingsRequest(BaseModel):
     enabled: Optional[bool] = None
     channels: Optional[List[str]] = None
@@ -1724,6 +1728,71 @@ def retry_failed_fetches(request: RetryFailedRequest, background_tasks: Backgrou
 @app.get("/api/watcher/settings")
 def get_watcher_settings():
     return reliability_store.get_settings()
+
+
+def _same_channel(left: str, right: str) -> bool:
+    """Compare channel URLs the way a person would.
+
+    The watcher list is typed by hand, so the same channel arrives as a bare handle,
+    a full URL, with or without a trailing slash, in any case.
+    """
+    def key(value: str) -> str:
+        text = str(value or "").strip().lower().rstrip("/")
+        for prefix in ("https://", "http://", "www.", "youtube.com/", "m.youtube.com/"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        return text.lstrip("@")
+
+    return key(left) == key(right)
+
+
+@app.get("/api/watcher/following")
+def get_following(channel: str = ""):
+    """Whether a channel is being watched, for a follow control in the UI."""
+    channels = reliability_store.get_settings().get("channels") or []
+    return {
+        "channel": channel,
+        "following": any(_same_channel(channel, existing) for existing in channels),
+        "channels": channels,
+    }
+
+
+@app.post("/api/watcher/follow")
+def follow_channel(request: FollowChannelRequest):
+    """Add one channel to the watch list without rewriting the whole list."""
+    channel = (request.channel or "").strip()
+    if not channel:
+        raise HTTPException(status_code=400, detail="channel is required")
+
+    settings = reliability_store.get_settings()
+    channels = list(settings.get("channels") or [])
+    if any(_same_channel(channel, existing) for existing in channels):
+        return {"status": "unchanged", "following": True, "channels": channels}
+
+    channels.append(channel)
+    # Following a channel is a request to actually watch it.
+    settings = reliability_store.update_settings({"channels": channels, "enabled": True})
+    record_event("success", "channel_followed", f"Now following {channel}", {
+        "channel": channel,
+        "channel_count": len(settings["channels"]),
+    })
+    return {"status": "success", "following": True, "channels": settings["channels"]}
+
+
+@app.post("/api/watcher/unfollow")
+def unfollow_channel(request: FollowChannelRequest):
+    channel = (request.channel or "").strip()
+    settings = reliability_store.get_settings()
+    remaining = [c for c in (settings.get("channels") or []) if not _same_channel(channel, c)]
+    if len(remaining) == len(settings.get("channels") or []):
+        return {"status": "unchanged", "following": False, "channels": remaining}
+
+    settings = reliability_store.update_settings({"channels": remaining})
+    record_event("info", "channel_unfollowed", f"Stopped following {channel}", {
+        "channel": channel,
+        "channel_count": len(settings["channels"]),
+    })
+    return {"status": "success", "following": False, "channels": settings["channels"]}
 
 
 @app.put("/api/watcher/settings")

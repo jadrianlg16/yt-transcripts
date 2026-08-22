@@ -440,6 +440,53 @@ class Stage5ApiTests(unittest.TestCase):
             )
         )
 
+    def test_following_a_channel_adds_it_and_turns_the_watcher_on(self):
+        response = self.client.post("/api/watcher/follow", json={"channel": "https://youtube.com/@test"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["following"])
+        settings = self.client.get("/api/watcher/settings").json()
+        self.assertIn("https://youtube.com/@test", settings["channels"])
+        self.assertTrue(settings["enabled"], "following a channel should mean it is watched")
+
+    def test_the_same_channel_written_differently_is_not_followed_twice(self):
+        self.client.post("/api/watcher/follow", json={"channel": "https://www.youtube.com/@Test/"})
+
+        again = self.client.post("/api/watcher/follow", json={"channel": "@test"})
+
+        self.assertEqual(again.json()["status"], "unchanged")
+        self.assertEqual(len(again.json()["channels"]), 1)
+
+    def test_following_state_is_reported_for_any_form_of_the_url(self):
+        self.client.post("/api/watcher/follow", json={"channel": "@test"})
+
+        for variant in ("@test", "https://youtube.com/@test", "https://www.youtube.com/@Test/"):
+            with self.subTest(variant=variant):
+                res = self.client.get("/api/watcher/following", params={"channel": variant})
+                self.assertTrue(res.json()["following"])
+
+    def test_unfollowing_removes_only_that_channel(self):
+        self.client.post("/api/watcher/follow", json={"channel": "@keep"})
+        self.client.post("/api/watcher/follow", json={"channel": "@drop"})
+
+        response = self.client.post("/api/watcher/unfollow", json={"channel": "@drop"})
+
+        self.assertFalse(response.json()["following"])
+        self.assertEqual(response.json()["channels"], ["@keep"])
+
+    def test_unfollowing_something_not_followed_changes_nothing(self):
+        self.client.post("/api/watcher/follow", json={"channel": "@keep"})
+
+        response = self.client.post("/api/watcher/unfollow", json={"channel": "@never"})
+
+        self.assertEqual(response.json()["status"], "unchanged")
+        self.assertEqual(response.json()["channels"], ["@keep"])
+
+    def test_following_an_empty_channel_is_rejected(self):
+        response = self.client.post("/api/watcher/follow", json={"channel": "   "})
+
+        self.assertEqual(response.status_code, 400)
+
     def test_pacing_is_slow_and_uneven_enough_to_stay_under_the_limit(self):
         gaps = [main._video_gap_seconds(index) for index in range(1, 31)]
 
