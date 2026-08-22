@@ -241,7 +241,9 @@ class SQLiteVectorStore:
             "chunk_count": int(row["chunks"] or 0),
             "video_count": int(row["videos"] or 0),
             "embedding_model": model_row["embedding_model"] if model_row else "",
-            "dimensions": self.dimensions,
+            # What the table was actually built with, which is not necessarily what
+            # this object was constructed with.
+            "dimensions": stored_dimensions(self.db_path) or self.dimensions,
             "size_bytes": size,
         }
 

@@ -23,6 +23,13 @@ from core.research import library_stats, search_entries, words
 from core.topics import build_topic_model, related_videos, top_topics, video_topics
 from core.runtime_settings import load_mcp_settings
 from core.semantic_search import load_semantic_index, search_semantic_items
+from core.vector_store import (
+    SQLiteVectorStore,
+    VectorStoreUnavailable,
+    default_vector_db_path,
+    extension_available,
+    stored_dimensions,
+)
 from core.store import DATA_FILE, SQLITE_DATA_FILE, normalize_entry_display_fields
 
 
@@ -556,17 +563,27 @@ def _semantic_video_results(
         "reason": "Semantic index has not been built.",
     }
 
-    try:
-        index = load_semantic_index(str(path))
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        diagnostics["reason"] = f"Semantic index could not be read: {exc}"
-        return [], diagnostics
+    # Prefer the sqlite-vec index. Reading the JSON one costs a full parse of every
+    # embedding just to discover whether an index exists.
+    vector_db = default_vector_db_path()
+    vector_width = stored_dimensions(vector_db) if extension_available() else 0
+    items: list[dict[str, Any]] = []
 
-    items = index.get("items") or []
-    if not items:
-        return [], diagnostics
+    if vector_width:
+        diagnostics["available"] = True
+        diagnostics["backend"] = "sqlite-vec"
+    else:
+        try:
+            index = load_semantic_index(str(path))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            diagnostics["reason"] = f"Semantic index could not be read: {exc}"
+            return [], diagnostics
 
-    diagnostics["available"] = True
+        items = index.get("items") or []
+        if not items:
+            return [], diagnostics
+        diagnostics["available"] = True
+        diagnostics["backend"] = "json_scan"
     settings = AISettingsStore(_data_path(DEFAULT_AI_SETTINGS_FILE)).get_settings()
     if not settings.get("enabled"):
         diagnostics["reason"] = "AI is disabled; lexical search remains available."
@@ -582,13 +599,21 @@ def _semantic_video_results(
         embeddings = response.get("embeddings") or []
         if not embeddings:
             raise OllamaClientError("Ollama returned no query embedding")
-        chunk_results = search_semantic_items(
-            items,
-            embeddings[0],
-            limit=max(limit * 8, 40),
-            embedding_model=settings["embedding_model"],
-        )
-    except (OllamaClientError, OSError, ValueError) as exc:
+        wanted = max(limit * 8, 40)
+        if vector_width and len(embeddings[0]) == vector_width:
+            store = SQLiteVectorStore(vector_db, vector_width)
+            chunk_results = store.search(embeddings[0], limit=wanted)
+        else:
+            if not items:
+                items = load_semantic_index(str(path)).get("items") or []
+            chunk_results = search_semantic_items(
+                items,
+                embeddings[0],
+                limit=wanted,
+                embedding_model=settings["embedding_model"],
+            )
+            diagnostics["backend"] = "json_scan"
+    except (OllamaClientError, OSError, ValueError, VectorStoreUnavailable) as exc:
         diagnostics["reason"] = f"Semantic query unavailable: {exc}"
         return [], diagnostics
 

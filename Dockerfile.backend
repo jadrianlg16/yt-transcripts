@@ -1,8 +1,9 @@
 # yt-transcripts FastAPI backend.
 FROM python:3.12-slim
 WORKDIR /app
-# yt-dlp shells out to ffmpeg to pull the audio track for speech transcription.
-RUN apt-get update  && apt-get install -y --no-install-recommends ffmpeg  && rm -rf /var/lib/apt/lists/*
+# ffmpeg so yt-dlp can extract audio; tzdata so named timezones resolve, which the
+# watcher needs to run its check windows in local time rather than UTC.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tzdata && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .

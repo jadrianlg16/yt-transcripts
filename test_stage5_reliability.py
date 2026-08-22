@@ -420,6 +420,9 @@ class Stage5ApiTests(unittest.TestCase):
             "channels": ["https://youtube.com/@test"],
             "frequency_minutes": 30,
         })
+        # An unscheduled watcher books a slot rather than firing, so give it one
+        # that is already due.
+        main.reliability_store.update_settings({"next_check_at": "2020-01-01T00:00:00+00:00"})
         settings = main.reliability_store.get_settings()
         self.assertTrue(main.watcher_due(settings))
 

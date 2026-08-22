@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -23,6 +23,9 @@ DEFAULT_WATCHER_SETTINGS = {
     "languages": ["en"],
     "last_checked_at": None,
     "next_check_at": None,
+    # Daily windows the watcher may run in, as "HH:MM" pairs in local time. Empty
+    # means the defaults in core/schedule.py.
+    "check_windows": [],
 }
 
 DEFAULT_COOLDOWN = {
@@ -379,6 +382,27 @@ def normalize_run(run: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def normalize_check_windows(value: Any) -> list[list[str]]:
+    """Keep only well-formed "HH:MM" pairs where the start precedes the end."""
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    windows: list[list[str]] = []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        try:
+            start = time.fromisoformat(str(item[0]))
+            end = time.fromisoformat(str(item[1]))
+        except (TypeError, ValueError):
+            continue
+        if start >= end:
+            continue
+        windows.append([start.strftime("%H:%M"), end.strftime("%H:%M")])
+
+    return sorted(windows, key=lambda pair: pair[0])
+
+
 def normalize_watcher_settings(settings: dict[str, Any]) -> dict[str, Any]:
     raw_frequency = settings.get("frequency_minutes", DEFAULT_FREQUENCY_MINUTES)
     try:
@@ -393,6 +417,7 @@ def normalize_watcher_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "languages": normalize_languages(settings.get("languages")),
         "last_checked_at": settings.get("last_checked_at"),
         "next_check_at": settings.get("next_check_at"),
+        "check_windows": normalize_check_windows(settings.get("check_windows")),
     }
 
 

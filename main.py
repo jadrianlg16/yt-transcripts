@@ -25,6 +25,7 @@ from uuid import uuid4
 from core.store import DATA_FILE, SQLITE_DATA_FILE, TranscriptRepository, create_transcript_store
 from core.audio import AudioDownloadError, audio_available, discard_audio, download_audio
 from core.channel_listing import list_channel_videos
+from core.schedule import DEFAULT_WINDOWS, describe_windows, next_check_after, normalize_windows
 from core.media_archive import (
     DEFAULT_QUALITY,
     QUALITY_FORMATS,
@@ -102,6 +103,8 @@ ai_artifact_store = AIArtifactStore(AI_ARTIFACTS_PATH)
 semantic_index_store = SemanticIndexStore(str(SEMANTIC_INDEX_PATH))
 VECTOR_DB_PATH = default_vector_db_path()
 _vector_store: SQLiteVectorStore | None = None
+# Sync endpoints run in a thread pool, so two requests can race to build this.
+_vector_store_lock = threading.Lock()
 DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 BACKEND_EVENTS_LIMIT = 300
 backend_events = deque(maxlen=BACKEND_EVENTS_LIMIT)
@@ -1075,11 +1078,26 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
         return None
 
 
-def _next_watcher_check_at(frequency_minutes: int) -> str:
-    return (
-        datetime.now().astimezone()
-        + timedelta(minutes=max(15, int(frequency_minutes or 360)))
-    ).replace(microsecond=0).isoformat()
+def watcher_windows() -> list[tuple[Any, Any]]:
+    """The daily windows the watcher may run in, from settings or the defaults."""
+    configured = reliability_store.get_settings().get("check_windows")
+    try:
+        normalize_windows(configured)
+        return configured or list(DEFAULT_WINDOWS)
+    except Exception:
+        logger.warning("Ignoring unusable check_windows, falling back to defaults")
+        return list(DEFAULT_WINDOWS)
+
+
+def _next_watcher_check_at(frequency_minutes: int | None = None) -> str:
+    """A random moment inside the next daily window.
+
+    frequency_minutes is kept for older stored settings but no longer decides
+    anything: a fixed interval produces the same few minutes every day, which is
+    both a pattern and more requests than checking twice is worth.
+    """
+    moment = next_check_after(datetime.now().astimezone(), watcher_windows())
+    return moment.replace(microsecond=0).isoformat()
 
 
 def channel_feed_url(channel: str) -> str:
@@ -1313,7 +1331,10 @@ def watcher_due(settings: dict[str, Any]) -> bool:
 
     next_check = _parse_iso_utc(settings.get("next_check_at"))
     if next_check is None:
-        return True
+        # Nothing scheduled yet. Book a slot rather than running immediately, or
+        # every restart would trigger a fetch.
+        reliability_store.update_settings({"next_check_at": _next_watcher_check_at()})
+        return False
     return datetime.now(next_check.tzinfo).replace(microsecond=0) >= next_check
 
 
@@ -1383,6 +1404,8 @@ class WatcherSettingsRequest(BaseModel):
     channels: Optional[List[str]] = None
     frequency_minutes: Optional[int] = None
     languages: Optional[List[str]] = None
+    # Pairs of "HH:MM" local times the watcher may run in. Empty means the defaults.
+    check_windows: Optional[List[List[str]]] = None
 
 class TranscriptEntry(BaseModel):
     video_id: str
@@ -1844,6 +1867,30 @@ def _same_channel(left: str, right: str) -> bool:
     return key(left) == key(right)
 
 
+@app.get("/api/watcher/schedule")
+def get_watcher_schedule():
+    """When the watcher will next look, and the windows it picks from."""
+    settings = reliability_store.get_settings()
+    return {
+        "enabled": settings.get("enabled", False),
+        "windows": describe_windows(watcher_windows()),
+        "next_check_at": settings.get("next_check_at"),
+        "last_checked_at": settings.get("last_checked_at"),
+        "channels": settings.get("channels") or [],
+        "runs_per_day": len(describe_windows(watcher_windows())),
+    }
+
+
+@app.post("/api/watcher/schedule/reroll")
+def reroll_watcher_schedule():
+    """Pick a fresh time in the next window, for when you want to move it."""
+    settings = reliability_store.update_settings({"next_check_at": _next_watcher_check_at()})
+    record_event("info", "watcher_rescheduled", f"Next check at {settings['next_check_at']}", {
+        "next_check_at": settings["next_check_at"],
+    })
+    return {"status": "success", "next_check_at": settings["next_check_at"]}
+
+
 @app.get("/api/watcher/following")
 def get_following(channel: str = ""):
     """Whether a channel is being watched, for a follow control in the UI."""
@@ -2270,27 +2317,26 @@ def vector_store(dimensions: int | None = None) -> SQLiteVectorStore | None:
     if not width:
         return None
 
-    if _vector_store is not None and _vector_store.dimensions == width:
+    with _vector_store_lock:
+        if _vector_store is not None and _vector_store.dimensions == width:
+            return _vector_store
+        try:
+            _vector_store = SQLiteVectorStore(VECTOR_DB_PATH, width)
+        except VectorStoreUnavailable:
+            return None
         return _vector_store
-
-    try:
-        _vector_store = SQLiteVectorStore(VECTOR_DB_PATH, width)
-    except VectorStoreUnavailable:
-        return None
-    return _vector_store
 
 
 def _index_dimensions() -> int:
-    """Vector width, read from whichever index already exists."""
-    if VECTOR_DB_PATH.exists() and extension_available():
-        try:
-            probe = SQLiteVectorStore(VECTOR_DB_PATH, 1)
-        except VectorStoreUnavailable:
-            probe = None
-        if probe is not None:
-            stored = probe.stats().get("dimensions")
-            if stored:
-                return int(stored)
+    """Vector width, read from whichever index already exists.
+
+    Reads the width out of the existing schema rather than constructing a store to
+    ask it. Constructing one creates the table if it is missing, so probing with a
+    guessed width would leave a permanently wrong index behind.
+    """
+    stored = stored_dimensions(VECTOR_DB_PATH)
+    if stored:
+        return stored
 
     items = load_semantic_index(str(SEMANTIC_INDEX_PATH)).get("items") or []
     return len(items[0].get("vector") or []) if items else 0
@@ -2305,8 +2351,9 @@ def sync_vector_store() -> dict[str, Any]:
         return {"migrated": 0, "message": "sqlite-vec is not installed"}
 
     result = migrate_json_index(index, VECTOR_DB_PATH)
-    global _vector_store
-    _vector_store = None
+    with _vector_store_lock:
+        global _vector_store
+        _vector_store = None
     record_event("info", "vector_store_synced", f"Moved {result['migrated']} chunks into sqlite-vec", result)
     return result
 
