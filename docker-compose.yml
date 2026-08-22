@@ -10,6 +10,7 @@ services:
     environment:
       YT_TRANSCRIPTS_ALLOWED_ORIGINS: http://localhost:5014,http://127.0.0.1:5014,http://localhost:5173,http://127.0.0.1:5173
       YT_TRANSCRIPTS_DATA_DIR: /app/data
+      YT_TRANSCRIPTS_VECTOR_DIR: /app/vectors
       YT_TRANSCRIPTS_HOST: 0.0.0.0
       YT_TRANSCRIPTS_OLLAMA_BASE_URL: http://host.docker.internal:11434/api
       TRANSCRIPT_STORE_BACKEND: sqlite
@@ -20,6 +21,10 @@ services:
       YT_TRANSCRIPTS_DOWNLOADER_URL: ${YT_TRANSCRIPTS_DOWNLOADER_URL:-http://localhost:5013}
     volumes:
       - ./data:/app/data
+      # The vector index is derived data and is read heavily during a search, which
+      # is very slow through Docker Desktop's Windows file sharing. A volume keeps
+      # it on container-local storage; losing it only costs a rebuild.
+      - vector_index:/app/vectors
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=5)"]
       interval: 10s
@@ -65,3 +70,6 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  vector_index:

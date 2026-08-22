@@ -42,6 +42,14 @@ from core.fetch_reliability import DEFAULT_RELIABILITY_FILE, FetchReliabilitySto
 from core.organization import DEFAULT_ORGANIZATION_FILE, ResearchOrganizationStore, utc_now
 from core.research import library_stats, search_entries
 from core.topics import build_topic_model, related_videos, top_topics, video_topics
+from core.vector_store import (
+    SQLiteVectorStore,
+    VectorStoreUnavailable,
+    default_vector_db_path,
+    extension_available,
+    migrate_json_index,
+    stored_dimensions,
+)
 from core.vault import export_vault
 from core.sqlite_store import SQLiteTranscriptStore, export_entries_to_json, migrate_json_to_sqlite
 from core.ai_artifacts import DEFAULT_AI_ARTIFACTS_FILE, AIArtifactStore, transcript_hash
@@ -92,6 +100,8 @@ reliability_store = FetchReliabilityStore(RELIABILITY_PATH)
 ai_settings_store = AISettingsStore(AI_SETTINGS_PATH)
 ai_artifact_store = AIArtifactStore(AI_ARTIFACTS_PATH)
 semantic_index_store = SemanticIndexStore(str(SEMANTIC_INDEX_PATH))
+VECTOR_DB_PATH = default_vector_db_path()
+_vector_store: SQLiteVectorStore | None = None
 DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 BACKEND_EVENTS_LIMIT = 300
 backend_events = deque(maxlen=BACKEND_EVENTS_LIMIT)
@@ -2209,8 +2219,19 @@ def rebuild_ai_embeddings(request: EmbeddingsRebuildRequest):
             segments_per_chunk=max(1, int(request.segments_per_chunk or 8)),
             segment_overlap=max(0, int(request.segment_overlap or 0)),
         )
-        update_task_status(success_count=len(entries), message="Semantic index rebuilt")
-        finish_task("Semantic index rebuilt")
+        # Keep the searchable index in step with what was just built, or the next
+        # search would quietly use a stale one.
+        message = "Semantic index rebuilt"
+        try:
+            synced = sync_vector_store()
+            if synced.get("migrated"):
+                message = f"Semantic index rebuilt and {synced['migrated']} chunks indexed for search"
+        except Exception:
+            logger.exception("Vector store sync after rebuild failed")
+            message = "Semantic index rebuilt, but the fast search index could not be updated"
+
+        update_task_status(success_count=len(entries), message=message)
+        finish_task(message)
         return {
             "status": "success",
             "path": str(SEMANTIC_INDEX_PATH.resolve()),
@@ -2229,6 +2250,90 @@ def rebuild_ai_embeddings(request: EmbeddingsRebuildRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+def vector_store(dimensions: int | None = None) -> SQLiteVectorStore | None:
+    """The sqlite-vec index, or None when the extension is not installed.
+
+    Callers fall back to scanning the JSON index, which still works and is only
+    slower, so a missing extension degrades search rather than breaking it.
+    """
+    global _vector_store
+    if not extension_available():
+        return None
+
+    built_with = stored_dimensions(VECTOR_DB_PATH)
+    if dimensions and built_with and dimensions != built_with:
+        # The embedding model changed. Searching this index would raise, so hand
+        # back nothing and let the caller scan the JSON index instead.
+        return None
+
+    width = dimensions or built_with or _index_dimensions()
+    if not width:
+        return None
+
+    if _vector_store is not None and _vector_store.dimensions == width:
+        return _vector_store
+
+    try:
+        _vector_store = SQLiteVectorStore(VECTOR_DB_PATH, width)
+    except VectorStoreUnavailable:
+        return None
+    return _vector_store
+
+
+def _index_dimensions() -> int:
+    """Vector width, read from whichever index already exists."""
+    if VECTOR_DB_PATH.exists() and extension_available():
+        try:
+            probe = SQLiteVectorStore(VECTOR_DB_PATH, 1)
+        except VectorStoreUnavailable:
+            probe = None
+        if probe is not None:
+            stored = probe.stats().get("dimensions")
+            if stored:
+                return int(stored)
+
+    items = load_semantic_index(str(SEMANTIC_INDEX_PATH)).get("items") or []
+    return len(items[0].get("vector") or []) if items else 0
+
+
+def sync_vector_store() -> dict[str, Any]:
+    """Copy the JSON index into sqlite-vec. Safe to run repeatedly."""
+    index = load_semantic_index(str(SEMANTIC_INDEX_PATH))
+    if not index.get("items"):
+        return {"migrated": 0, "message": "No semantic index to move"}
+    if not extension_available():
+        return {"migrated": 0, "message": "sqlite-vec is not installed"}
+
+    result = migrate_json_index(index, VECTOR_DB_PATH)
+    global _vector_store
+    _vector_store = None
+    record_event("info", "vector_store_synced", f"Moved {result['migrated']} chunks into sqlite-vec", result)
+    return result
+
+
+@app.get("/api/ai/vector-store")
+def get_vector_store_status():
+    """What the vector index holds and whether it is being used."""
+    store_handle = vector_store()
+    stats = store_handle.stats() if store_handle else {"available": False, "chunk_count": 0}
+    return {
+        **stats,
+        "extension_installed": extension_available(),
+        "path": str(VECTOR_DB_PATH),
+        "in_use": bool(store_handle and stats.get("chunk_count")),
+    }
+
+
+@app.post("/api/ai/vector-store/sync")
+def post_vector_store_sync():
+    """Rebuild the sqlite-vec index from the JSON one."""
+    try:
+        return sync_vector_store()
+    except Exception as exc:
+        logger.exception("Vector store sync failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/semantic-search")
 def semantic_search(q: str, limit: int = 10):
     query = q.strip()
@@ -2236,8 +2341,16 @@ def semantic_search(q: str, limit: int = 10):
         return {"results": [], "message": "Search query is too short"}
 
     settings = ai_settings_store.get_settings()
-    index = load_semantic_index(str(SEMANTIC_INDEX_PATH))
-    if not index.get("items"):
+
+    # Ask the vector index whether anything is indexed. Reading the JSON index to
+    # answer that means parsing every embedding in the file, which costs seconds
+    # and is the reason searches felt slow even once the vectors moved to SQLite.
+    handle = vector_store()
+    indexed = bool(handle and handle.stats().get("chunk_count"))
+    if not indexed:
+        indexed = bool(load_semantic_index(str(SEMANTIC_INDEX_PATH)).get("items"))
+
+    if not indexed:
         return {
             "results": [],
             "message": "Semantic index has not been built",
@@ -2256,11 +2369,18 @@ def semantic_search(q: str, limit: int = 10):
         embeddings = response["embeddings"]
         if not embeddings:
             raise OllamaClientError("Ollama returned no query embedding")
-        results = semantic_index_store.search(
-            embeddings[0],
-            limit=bounded_limit(limit, default=10, maximum=50),
-            embedding_model=settings["embedding_model"],
-        )
+        bounded = bounded_limit(limit, default=10, maximum=50)
+        store_handle = vector_store(len(embeddings[0]))
+        if store_handle and store_handle.stats().get("chunk_count"):
+            results = store_handle.search(embeddings[0], limit=bounded)
+            search_backend = "sqlite-vec"
+        else:
+            results = semantic_index_store.search(
+                embeddings[0],
+                limit=bounded,
+                embedding_model=settings["embedding_model"],
+            )
+            search_backend = "json_scan"
     except (OllamaClientError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -2279,6 +2399,7 @@ def semantic_search(q: str, limit: int = 10):
         ],
         "embedding_model": settings["embedding_model"],
         "query": query,
+        "backend": search_backend,
     }
 
 

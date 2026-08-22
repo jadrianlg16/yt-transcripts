@@ -207,6 +207,31 @@ We are moving from a "Scraping Tool" to a **Personal Knowledge Engine**. Here ar
 
 ---
 
+### Search by meaning
+
+With local AI enabled and an index built, `semantic-search` finds passages by what they
+mean rather than the words used. "Picking a database for retrieval" surfaces the video
+about vector search without either phrase appearing in its title.
+
+Embeddings come from Ollama (`nomic-embed-text` by default) and are stored with
+**sqlite-vec**, an extension to the SQLite already here rather than a separate vector
+database to run. Rebuilding the index keeps both in step; `POST /api/ai/vector-store/sync`
+rebuilds the search index on its own, and `GET /api/ai/vector-store` reports what it holds.
+
+Two things measured on a 128-video, 10,919-chunk archive that are worth knowing:
+
+- Storing vectors as JSON meant parsing 179 MB to answer one query. In sqlite-vec the same
+  index is 42 MB and searches in about 10ms.
+- The index lives in a Docker volume, not the bind-mounted `data/` directory. The same
+  search measured 1039ms through Docker Desktop's Windows file sharing and 7ms on
+  container-local storage. It is derived data, so a volume costs nothing but a rebuild if
+  it is lost, while the transcripts stay on the host where they can be backed up.
+
+End to end a search is about 70ms, most of it Ollama embedding the query.
+
+If sqlite-vec is not installed, search falls back to scanning the JSON index. Slower, but
+it still answers.
+
 ### Keeping videos offline
 
 A transcript is half a record. If a video is taken down, edited, or made private, the
