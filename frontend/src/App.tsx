@@ -651,7 +651,10 @@ function App() {
     }
 
     const timer = window.setTimeout(async () => {
-      const params = new URLSearchParams({ q: query, limit: '20' });
+      // Wider than the results panel needs, because these ids also decide which
+      // videos the library list keeps when you type. At 20 the list silently hid
+      // matches that the search itself had found.
+      const params = new URLSearchParams({ q: query, limit: '100' });
       if (channelFilter !== 'all') {
         params.set('channel', channelFilter);
       }
