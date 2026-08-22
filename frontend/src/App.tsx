@@ -50,6 +50,8 @@ import { createAISettingsDraft, decodeDisplayText, getArrayValue, getBooleanValu
 import { countQueryMatches, countWords, formatDisplayDateTime, getDisplayDateValue, getQueryTerms, getTranscriptRuntime, parseDisplayDateMillis, parseSavedSearches } from './lib/format';
 import { fieldClass, iconButtonClass, panelClass, primaryButtonClass, secondaryButtonClass } from './lib/styles';
 import type {
+  ArchivedVideo,
+  ArchiveStorage,
   AIArtifact,
   AIHealthResult,
   AIModelOptions,
@@ -99,6 +101,10 @@ function App() {
   const [followBusy, setFollowBusy] = useState(false);
   const [speechAvailable, setSpeechAvailable] = useState(false);
   const [downloaderUrl, setDownloaderUrl] = useState('');
+  const [archivedIds, setArchivedIds] = useState<string[]>([]);
+  const [archiveStorage, setArchiveStorage] = useState<ArchiveStorage | null>(null);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [playingOffline, setPlayingOffline] = useState(false);
   const [selectedCandidates, setSelectedCandidates] = useState<string[]>([]);
   const [channelFilter, setChannelFilter] = useState('all');
   const [status, setStatus] = useState<TaskStatus>({ current_task: null, progress: 0, total: 0, message: 'Idle' });
@@ -360,6 +366,19 @@ function App() {
     }
   }, [markApiOnline, reportApiError]);
 
+  const fetchArchive = useCallback(async () => {
+    try {
+      const res = await axios.get<{ items: ArchivedVideo[]; storage: ArchiveStorage }>(`${API_BASE}/archive`);
+      setArchivedIds(res.data.items.map(item => item.video_id));
+      setArchiveStorage(res.data.storage);
+    } catch {
+      setArchivedIds([]);
+      setArchiveStorage(null);
+    }
+  }, []);
+
+  useEffect(() => { fetchArchive(); }, [fetchArchive]);
+
   const fetchWatcherSettings = useCallback(async () => {
     try {
       const res = await axios.get(`${API_BASE}/watcher/settings`);
@@ -550,6 +569,7 @@ function App() {
           fetchEmbeddingStatus();
           fetchSystemStatus();
           fetchDataTables();
+          fetchArchive();
         }
         lastTask = newStatus.current_task;
         fetchBackendEvents();
@@ -559,7 +579,7 @@ function App() {
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [addLog, fetchAIArtifacts, fetchAISettings, fetchBackendEvents, fetchDataTables, fetchEmbeddingStatus, fetchFetchRuns, fetchLibraryStats, fetchMcpStatus, fetchResearchOrganization, fetchStorageStatus, fetchSystemStatus, fetchTranscripts, fetchWatcherSettings, markApiOffline, markApiOnline]);
+  }, [addLog, fetchAIArtifacts, fetchAISettings, fetchBackendEvents, fetchDataTables, fetchEmbeddingStatus, fetchFetchRuns, fetchLibraryStats, fetchMcpStatus, fetchResearchOrganization, fetchStorageStatus, fetchSystemStatus, fetchTranscripts, fetchWatcherSettings, fetchArchive, markApiOffline, markApiOnline]);
 
   useEffect(() => {
     if (activeView === 'settings' && selectedRunId) {
@@ -788,6 +808,44 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, []);
+
+
+  const handleArchiveVideo = async () => {
+    if (!currentTranscript || archiveBusy || status.current_task) return;
+    setArchiveBusy(true);
+    try {
+      const res = await axios.post(`${API_BASE}/archive`, {
+        video_id: currentTranscript.video_id,
+        quality: '720p',
+      });
+      markApiOnline();
+      if (res.data.status === 'already_archived') {
+        addLog('Already archived', 'info');
+        fetchArchive();
+      } else {
+        setStatus(prev => ({ ...prev, run_id: res.data.run_id, current_task: 'archive', progress: 0, total: 1,
+          message: 'Archive queued...', success_count: 0, failure_count: 0, skipped_count: 0 }));
+        addLog(`Archiving ${currentTranscript.title}`, 'info');
+      }
+    } catch (error) {
+      reportApiError('Failed to archive video', error);
+    } finally {
+      setArchiveBusy(false);
+    }
+  };
+
+  const handleDeleteArchived = async () => {
+    if (!currentTranscript) return;
+    if (!confirm('Delete the stored video file? The transcript is kept.')) return;
+    try {
+      await axios.delete(`${API_BASE}/archive/${currentTranscript.video_id}`);
+      addLog('Deleted archived video file', 'success');
+      setPlayingOffline(false);
+      fetchArchive();
+    } catch (error) {
+      reportApiError('Failed to delete archived video', error);
+    }
+  };
 
   const handleTranscribeBySpeech = async () => {
     if (!currentTranscript || fetchRequestBusy || status.current_task) return;
@@ -1711,6 +1769,7 @@ function App() {
   const currentTimestampNotes = currentTranscript ? researchOrg.timestamp_notes[currentTranscript.video_id] ?? [] : [];
   const selectedRunFromList = fetchRuns.find(run => run.id === selectedRunId) ?? null;
   const visibleRun = selectedRun ?? selectedRunFromList;
+  const isArchived = Boolean(currentTranscript && archivedIds.includes(currentTranscript.video_id));
   const currentAISummary = currentTranscript ? summaryByVideoId[currentTranscript.video_id] : null;
   const selectedCompareTranscripts = compareVideoIds
     .map(videoId => transcriptById.get(videoId))
@@ -2668,6 +2727,37 @@ function App() {
                     Download
                   </a>
                 )}
+                {archiveStorage?.available && (
+                  isArchived ? (
+                    <>
+                      <button
+                        onClick={() => setPlayingOffline(value => !value)}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 font-medium text-emerald-800 hover:bg-emerald-100"
+                        title="Play the stored copy, no internet needed"
+                      >
+                        <Play className="h-4 w-4" />
+                        {playingOffline ? 'Hide player' : 'Play offline'}
+                      </button>
+                      <button
+                        onClick={handleDeleteArchived}
+                        className={iconButtonClass}
+                        title="Delete the stored video file, keep the transcript"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={handleArchiveVideo}
+                      disabled={archiveBusy || Boolean(status.current_task)}
+                      className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 font-medium text-slate-700 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+                      title="Keep a copy of the video, so it survives being taken down"
+                    >
+                      <Save className="h-4 w-4" />
+                      {status.current_task === 'archive' ? 'Saving' : 'Keep offline'}
+                    </button>
+                  )
+                )}
                 {speechAvailable && (
                   <button
                     onClick={handleTranscribeBySpeech}
@@ -2890,7 +2980,21 @@ function App() {
           {renderTranscriptList()}
         </aside>
         <section className="min-w-0 space-y-4">
-          {currentTranscript && renderSemanticResults()}
+          {currentTranscript && isArchived && playingOffline && (
+          <section className={`${panelClass} overflow-hidden`}>
+            <video
+              key={currentTranscript.video_id}
+              controls
+              preload="metadata"
+              className="w-full bg-black"
+              src={`${API_BASE}/archive/${currentTranscript.video_id}/file`}
+            />
+            <div className="px-4 py-2 text-xs text-slate-500">
+              Playing the stored copy. Seeking works; nothing is requested from YouTube.
+            </div>
+          </section>
+        )}
+        {currentTranscript && renderSemanticResults()}
           {renderTranscriptDetail()}
         </section>
         <aside className="space-y-4">

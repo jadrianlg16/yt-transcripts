@@ -340,3 +340,22 @@ export interface LogEntry {
   event?: string;
   details?: Record<string, unknown>;
 }
+
+export interface ArchivedVideo {
+  video_id: string;
+  title: string;
+  channel: string;
+  filename: string;
+  size_bytes: number;
+  archived_at: number;
+  has_transcript: boolean;
+}
+
+export interface ArchiveStorage {
+  path: string;
+  exists: boolean;
+  count: number;
+  used_bytes: number;
+  free_bytes: number | null;
+  available: boolean;
+}

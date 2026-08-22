@@ -207,6 +207,21 @@ We are moving from a "Scraping Tool" to a **Personal Knowledge Engine**. Here ar
 
 ---
 
+### Keeping videos offline
+
+A transcript is half a record. If a video is taken down, edited, or made private, the
+words survive but the thing they describe does not. **Keep offline** on any transcript
+stores the video file itself, and **Play offline** plays it back from disk with no
+request to YouTube. Seeking works.
+
+Files land in `data/media/` (override with `YT_TRANSCRIPTS_MEDIA_DIR`) named by video
+id, and the filesystem is the source of truth: deleting a file un-archives that video,
+with nothing to fall out of step. Quality defaults to 720p; 1080p, 480p and audio-only
+are available, and the archive view reports what the collection is costing in disk.
+
+Video is large. A twenty minute talk is roughly 60 MB at 480p, so archive what is worth
+keeping rather than everything.
+
 ### When ingestion is paused
 
 After a run gives up, `GET /api/fetch/cooldown` reports how long is left and how many

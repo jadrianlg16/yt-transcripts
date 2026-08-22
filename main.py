@@ -25,6 +25,17 @@ from uuid import uuid4
 from core.store import DATA_FILE, SQLITE_DATA_FILE, TranscriptRepository, create_transcript_store
 from core.audio import AudioDownloadError, audio_available, discard_audio, download_audio
 from core.channel_listing import list_channel_videos
+from core.media_archive import (
+    DEFAULT_QUALITY,
+    QUALITY_FORMATS,
+    MediaArchiveError,
+    archived_path,
+    archiving_available,
+    download_video,
+    list_archived,
+    remove_archived,
+    storage_summary,
+)
 from core.speech import SpeechServiceError, service_health, speech_enabled, transcribe_file
 from core.fetcher import extract_video_id, fetch_video_full
 from core.fetch_reliability import DEFAULT_RELIABILITY_FILE, FetchReliabilityStore, youtube_watch_url
@@ -2701,6 +2712,91 @@ class SpeechTranscribeRequest(BaseModel):
     url: str
     diarize: bool = True
     model: str = "small"
+
+
+class ArchiveVideoRequest(BaseModel):
+    video_id: str
+    quality: str = DEFAULT_QUALITY
+
+
+@app.get("/api/archive")
+def get_archive():
+    """Videos kept on disk, with what they cost in storage."""
+    entries_by_id = {str(e.get("video_id")): e for e in store.all_entries()}
+    return {
+        "items": list_archived(entries_by_id),
+        "storage": storage_summary(),
+        "qualities": sorted(QUALITY_FORMATS),
+    }
+
+
+def background_archive_video(video_id: str, quality: str, run_id: str):
+    run_id = begin_task("archive", f"Archiving {video_id}...", total=1, run_id=run_id)
+    reliability_store.start_run("archive", video_id, total=1, run_id=run_id)
+    try:
+        def report(line: str) -> None:
+            update_task_status(message=f"Archiving {video_id}: {line[:80]}")
+
+        path = download_video(video_id, quality=quality, on_progress=report)
+        size_mb = path.stat().st_size / 1_000_000
+        message = f"Archived {path.name} ({size_mb:.0f} MB)"
+        update_task_status(progress=1, success_count=1, message=message)
+        record_event("success", "video_archived", message, {
+            "run_id": run_id,
+            "video_id": video_id,
+            "quality": quality,
+            "size_bytes": path.stat().st_size,
+        })
+        reliability_store.finish_run(run_id, message=message)
+        finish_task(message)
+    except Exception as exc:
+        logger.exception("Archiving failed")
+        update_task_status(message=f"Error: {exc}", failure_count=task_status["failure_count"] + 1)
+        _record_fetch_failure(run_id, exc, video_id=video_id)
+        reliability_store.finish_run(run_id, message=f"Error: {exc}")
+        record_event("error", "video_archive_failed", str(exc), {"run_id": run_id, "video_id": video_id})
+        finish_task(f"Error: {exc}", level="error")
+
+
+@app.post("/api/archive")
+def archive_video(request: ArchiveVideoRequest, background_tasks: BackgroundTasks):
+    """Keep a copy of the video itself, so the record survives it being taken down."""
+    _ensure_ingestion_allowed()
+    if not archiving_available():
+        raise HTTPException(status_code=503, detail="yt-dlp is not installed, so videos cannot be archived")
+    if request.quality not in QUALITY_FORMATS:
+        raise HTTPException(status_code=400, detail=f"quality must be one of {sorted(QUALITY_FORMATS)}")
+
+    if archived_path(request.video_id) is not None:
+        return {"status": "already_archived", "video_id": request.video_id}
+
+    run_id = queue_task("archive", "Archive queued...", total=1)
+    background_tasks.add_task(background_archive_video, request.video_id, request.quality, run_id)
+    return {"status": "started", "run_id": run_id}
+
+
+@app.get("/api/archive/{video_id}/file")
+def stream_archived_video(video_id: str):
+    """Serve the stored file. Range requests are handled, so seeking works."""
+    path = archived_path(video_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Video is not archived")
+    return FileResponse(path, filename=path.name)
+
+
+@app.delete("/api/archive/{video_id}")
+def delete_archived_video(video_id: str):
+    """Delete the stored file. The transcript is untouched."""
+    try:
+        removed = remove_archived(video_id)
+    except MediaArchiveError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not removed:
+        raise HTTPException(status_code=404, detail="Video is not archived")
+
+    record_event("info", "archived_video_deleted", f"Deleted archived video {video_id}", {"video_id": video_id})
+    return {"status": "success", "video_id": video_id}
 
 
 @app.get("/api/downloader")
